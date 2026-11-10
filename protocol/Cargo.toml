@@ -1,0 +1,40 @@
+[package]
+name = "lightspeed-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LightSpeed tunnel protocol — shared between client and proxy"
+
+[features]
+default = []
+# Enable QUIC stream read/write helpers (requires quinn)
+quic = ["dep:quinn"]
+# Enable TCP frame read/write helpers (requires tokio)
+tokio = ["dep:tokio"]
+
+[dependencies]
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# Optional: QUIC stream helpers
+quinn = { version = "0.11", optional = true }
+
+# Optional: TCP frame read/write helpers
+tokio = { version = "1", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt", "io-util"] }
+
+[[bench]]
+name = "header_bench"
+harness = false
+
+[[bench]]
+name = "fec_bench"
+harness = false

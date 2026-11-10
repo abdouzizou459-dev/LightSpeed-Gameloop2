@@ -1,0 +1,802 @@
+//! # Client Authentication
+//!
+//! Token-keyed authentication for tunnel clients. Authorization is granted on
+//! the QUIC control plane at Register and checked per-packet on the data plane.
+//!
+//! ## Strategy
+//! 1. Client connects via QUIC and sends Register
+//! 2. Proxy assigns a random session token (u32), returned in RegisterAck
+//! 3. Client includes the token in every tunnel header's `session_token` field
+//! 4. Proxy validates (principal + optional bound port + token + expiry) per packet
+//!
+//! ## Reconnect and NAT isolation
+//!
+//! Entries are keyed by token, not by IP, so two clients behind the same NAT
+//! hold independent authorizations and closing one does not revoke the other.
+//! A same-principal re-registration demotes the previous token to a short
+//! [`PREVIOUS_TOKEN_GRACE`] window, and a transport close revokes with a grace
+//! window sized for a client reconnect. An explicit rotation request demotes
+//! the token it supersedes through that same window. [`Authenticator::sweep`]
+//! drops expired entries.
+//!
+//! ## Security Properties
+//! - **Principal binding**: the entry records the IP observed at registration
+//! - **Optional port binding**: a client reporting a data port is pinned to it
+//! - **Expiry**: every entry has a deadline; a live control connection refreshes it
+//! - **Fail closed**: a full table refuses new tokens rather than evicting
+//!
+//! ## Limitations
+//! - 32-bit token space (4 billion values), infeasible to brute-force
+//! - No per-packet crypto (game packets are latency-sensitive)
+
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
+
+use crate::handoff::AuthTokenSnapshot;
+
+/// Lifetime of a freshly issued token.
+/// How long a data-plane token stays valid.
+pub const TOKEN_TTL: Duration = lightspeed_protocol::SESSION_TOKEN_TTL;
+
+/// Grace window for the previous token after a same-principal re-registration.
+pub const PREVIOUS_TOKEN_GRACE: Duration = Duration::from_secs(30);
+
+/// Grace window applied when a registration's transport closes. Sized so a
+/// client can reconnect and re-register without a data-plane outage.
+pub const TRANSPORT_REVOKE_GRACE: Duration = Duration::from_secs(120);
+
+/// Grace window applied on an explicit `Disconnect`.
+pub const EXPLICIT_REVOKE_GRACE: Duration = Duration::from_secs(10);
+
+/// Hard cap on tracked tokens. A full table refuses new tokens (fail closed),
+/// mirroring the rate limiter's table discipline.
+pub const MAX_AUTH_ENTRIES: usize = 65_536;
+
+/// One authorized data-plane token.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthEntry {
+    principal: Ipv4Addr,
+    bound_port: Option<u16>,
+    expires_at: Instant,
+}
+
+/// Cap an entry's deadline to the short [`PREVIOUS_TOKEN_GRACE`] window.
+///
+/// Shared by same-principal re-registration and by [`Authenticator::rotate`],
+/// so a superseded token is demoted through exactly one mechanism. A token
+/// already closer to expiry is left untouched.
+fn demote_to_previous_grace(entry: &mut AuthEntry, now: Instant) {
+    let deadline = now + PREVIOUS_TOKEN_GRACE;
+    if entry.expires_at > deadline {
+        entry.expires_at = deadline;
+    }
+}
+
+/// Token-based authenticator for the data plane.
+///
+/// Thread-safe when wrapped in `Arc<RwLock<Authenticator>>`.
+/// The read path (`validate`) is the hot path, called per-packet.
+/// The write path (`authorize`/`revoke`) is cold, only on QUIC events.
+pub struct Authenticator {
+    /// Authorized tokens, keyed by the token itself.
+    tokens: HashMap<u32, AuthEntry>,
+    /// Whether authentication is enforced.
+    /// When false, all packets are allowed (backward-compatible dev mode).
+    require_auth: bool,
+    /// Hard cap on tracked entries; a full table fails closed.
+    max_entries: usize,
+}
+
+impl Authenticator {
+    /// Create a new authenticator.
+    pub fn new(require_auth: bool) -> Self {
+        Self {
+            tokens: HashMap::new(),
+            require_auth,
+            max_entries: MAX_AUTH_ENTRIES,
+        }
+    }
+
+    /// Test-only: create an authenticator with a bounded token table.
+    #[cfg(test)]
+    fn with_max_entries(require_auth: bool, max_entries: usize) -> Self {
+        Self {
+            tokens: HashMap::new(),
+            require_auth,
+            max_entries,
+        }
+    }
+
+    /// Authorize a token for `principal`.
+    ///
+    /// `data_port` is the client's data-plane source port, or 0 when the client
+    /// does not report one (the token is then bound to the principal only).
+    /// An existing token for the same principal *and* data port is capped to a
+    /// short [`PREVIOUS_TOKEN_GRACE`] window so a reconnecting client can
+    /// overlap. A principal-only registration demotes nothing, because it
+    /// cannot prove it supersedes another client behind the same NAT.
+    /// Fails closed when the table is full and the token is new.
+    pub fn authorize(&mut self, principal: Ipv4Addr, data_port: u16, token: u32, now: Instant) {
+        if !self.tokens.contains_key(&token) && self.tokens.len() >= self.max_entries {
+            tracing::warn!(
+                principal = %principal,
+                "Auth token table full, refusing to authorize new token"
+            );
+            return;
+        }
+
+        // Demote only a token that demonstrably belongs to the same client,
+        // identified by principal plus the reported data port. Demoting every
+        // same-principal token would let two clients behind one NAT truncate
+        // each other to the previous-token grace window.
+        if data_port != 0 {
+            for entry in self.tokens.values_mut() {
+                if entry.principal == principal && entry.bound_port == Some(data_port) {
+                    demote_to_previous_grace(entry, now);
+                }
+            }
+        }
+
+        self.tokens.insert(
+            token,
+            AuthEntry {
+                principal,
+                bound_port: (data_port != 0).then_some(data_port),
+                expires_at: now + TOKEN_TTL,
+            },
+        );
+        tracing::info!(principal = %principal, token = token, "Authorized data-plane token");
+    }
+
+    /// Revoke a token, retaining it for `grace` so an in-flight reconnect can
+    /// still validate. Sweeping later removes the tombstone.
+    pub fn revoke(&mut self, token: u32, now: Instant, grace: Duration) {
+        if let Some(entry) = self.tokens.get_mut(&token) {
+            entry.expires_at = now + grace;
+            tracing::info!(
+                token = token,
+                grace_secs = grace.as_secs(),
+                "Revoked data-plane token"
+            );
+        }
+    }
+
+    /// Extend a live token's expiry to a full [`TOKEN_TTL`] from `now`.
+    /// Called on control-plane activity so a connected client never expires.
+    pub fn refresh(&mut self, token: u32, now: Instant) {
+        if let Some(entry) = self.tokens.get_mut(&token) {
+            entry.expires_at = now + TOKEN_TTL;
+        }
+    }
+
+    /// Rotate a live token for `principal`: issue a fresh random token and
+    /// demote `current_token` to the short [`PREVIOUS_TOKEN_GRACE`] window.
+    ///
+    /// The presented token authenticates the request: it must be live and
+    /// belong to `principal`, so a caller cannot rotate a token it does not
+    /// hold. The fresh token inherits the old token's port binding and starts
+    /// a full [`TOKEN_TTL`]. Rotation obeys the same fail-closed table cap as
+    /// registration, so it is no unbounded path to new entries.
+    ///
+    /// Returns the fresh token, or `None` when `current_token` is unknown,
+    /// foreign, expired, or the table is full.
+    pub fn rotate(&mut self, principal: Ipv4Addr, current_token: u32, now: Instant) -> Option<u32> {
+        let current = *self.tokens.get(&current_token)?;
+        if current.principal != principal || current.expires_at <= now {
+            tracing::debug!(
+                principal = %principal,
+                token = current_token,
+                "Refusing to rotate an unknown, foreign, or expired token"
+            );
+            return None;
+        }
+        if self.tokens.len() >= self.max_entries {
+            tracing::warn!(
+                principal = %principal,
+                "Auth token table full, refusing to rotate session token"
+            );
+            return None;
+        }
+
+        let new_token = Self::generate_token();
+        if let Some(entry) = self.tokens.get_mut(&current_token) {
+            demote_to_previous_grace(entry, now);
+        }
+        self.tokens.insert(
+            new_token,
+            AuthEntry {
+                principal,
+                bound_port: current.bound_port,
+                expires_at: now + TOKEN_TTL,
+            },
+        );
+        tracing::info!(
+            principal = %principal,
+            old_token = current_token,
+            new_token = new_token,
+            "Rotated data-plane token"
+        );
+        Some(new_token)
+    }
+
+    /// Remove every token for `principal` immediately (abuse ban, no grace).
+    pub fn ban(&mut self, principal: Ipv4Addr) {
+        let before = self.tokens.len();
+        self.tokens.retain(|_, entry| entry.principal != principal);
+        let removed = before - self.tokens.len();
+        if removed > 0 {
+            tracing::warn!(
+                principal = %principal,
+                removed = removed,
+                "Banned principal, revoked data-plane tokens"
+            );
+        }
+    }
+
+    /// Drop every entry whose deadline is at or before `now`.
+    pub fn sweep(&mut self, now: Instant) -> usize {
+        let before = self.tokens.len();
+        self.tokens.retain(|_, entry| entry.expires_at > now);
+        before - self.tokens.len()
+    }
+
+    /// Snapshot every live token for handoff.
+    ///
+    /// Entries whose deadline is at or before `now` are dropped; every surviving
+    /// entry reports its remaining lifetime in milliseconds.
+    pub fn snapshot(&self, now: Instant) -> Vec<AuthTokenSnapshot> {
+        self.tokens
+            .iter()
+            .filter_map(|(&token, entry)| {
+                let remaining = entry.expires_at.checked_duration_since(now)?;
+                Some(AuthTokenSnapshot {
+                    token,
+                    principal: entry.principal.to_string(),
+                    bound_port: entry.bound_port.unwrap_or(0),
+                    ttl_ms_remaining: remaining.as_millis() as u64,
+                })
+            })
+            .collect()
+    }
+
+    /// Restore tokens from a handoff snapshot.
+    ///
+    /// Each entry's deadline is re-anchored to `now + ttl_ms_remaining`, so a
+    /// token valid at handoff stays valid for exactly its remaining lifetime.
+    /// The table's fail-closed cap is preserved: new tokens beyond
+    /// [`Self::max_entries`] are refused rather than evicting a live entry.
+    pub fn restore(&mut self, snaps: &[AuthTokenSnapshot], now: Instant) {
+        for snap in snaps {
+            let principal = match snap.principal.parse::<Ipv4Addr>() {
+                Ok(principal) => principal,
+                Err(_) => {
+                    tracing::warn!(
+                        principal = %snap.principal,
+                        "Skipping handoff auth entry with unparseable principal"
+                    );
+                    continue;
+                }
+            };
+            if !self.tokens.contains_key(&snap.token) && self.tokens.len() >= self.max_entries {
+                tracing::warn!("Auth token table full, refusing to restore token");
+                continue;
+            }
+            self.tokens.insert(
+                snap.token,
+                AuthEntry {
+                    principal,
+                    bound_port: (snap.bound_port != 0).then_some(snap.bound_port),
+                    expires_at: now + Duration::from_millis(snap.ttl_ms_remaining),
+                },
+            );
+        }
+    }
+
+    /// Validate a packet's (principal, data_port, token) triple.
+    /// This is the **hot path**, called for every data plane packet.
+    ///
+    /// Returns `true` if:
+    /// - Auth is disabled (`require_auth = false`), OR
+    /// - The token is known, belongs to `principal`, matches the bound port
+    ///   (when one was recorded), and has not expired.
+    #[inline]
+    pub fn validate(&self, principal: Ipv4Addr, data_port: u16, token: u32, now: Instant) -> bool {
+        if !self.require_auth {
+            return true;
+        }
+        self.tokens.get(&token).is_some_and(|entry| {
+            entry.principal == principal
+                && match entry.bound_port {
+                    Some(bound) => bound == data_port,
+                    None => true,
+                }
+                && entry.expires_at > now
+        })
+    }
+
+    /// Generate a random session token for a new client.
+    pub fn generate_token() -> u32 {
+        rand::random::<u32>()
+    }
+
+    /// Number of tracked tokens (live and not-yet-swept).
+    pub fn client_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Whether auth enforcement is enabled.
+    pub fn is_enforced(&self) -> bool {
+        self.require_auth
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lightspeed_protocol::{TunnelHeader, PROTOCOL_VERSION_TCP};
+
+    fn ip(last: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, last)
+    }
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    #[test]
+    fn test_authorize_and_validate() {
+        let mut auth = Authenticator::new(true);
+        let principal = Ipv4Addr::new(192, 168, 1, 100);
+        let now = t0();
+
+        assert!(!auth.validate(principal, 0, 42, now));
+        auth.authorize(principal, 0, 42, now);
+        assert!(auth.validate(principal, 0, 42, now));
+        assert!(!auth.validate(principal, 0, 99, now));
+        assert_eq!(auth.client_count(), 1);
+    }
+
+    #[test]
+    fn v5_packet_validates_with_the_same_token_as_v3() {
+        // Per-packet validation is version-agnostic: `validate` reads only the
+        // shared `TunnelHeader.session_token` field, so a v5 packet (the new
+        // TCP wire format) must pass with exactly the same token as a v3
+        // packet. This pins that no version-specific auth branch is needed.
+        let mut auth = Authenticator::new(true);
+        let principal = Ipv4Addr::new(192, 168, 1, 100);
+        let now = t0();
+        let token = 0xDEAD_BEEF;
+        auth.authorize(principal, 0, token, now);
+
+        let src = std::net::SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345);
+        let dst = std::net::SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 25565);
+
+        // A v3 packet with the token validates.
+        let v3 = TunnelHeader::new(1, 1_000_000, src, dst).with_session_token(token);
+        assert!(auth.validate(principal, 0, v3.session_token, now));
+
+        // The same header with the version nibble changed to 5 (and its wire
+        // bytes decoded back) carries the identical token and also validates.
+        let mut v5_header = TunnelHeader::new(1, 1_000_000, src, dst).with_session_token(token);
+        v5_header.version = PROTOCOL_VERSION_TCP;
+        let decoded = TunnelHeader::decode(&v5_header.encode()).expect("v5 decodes");
+        assert_eq!(decoded.version, PROTOCOL_VERSION_TCP);
+        assert_eq!(decoded.session_token, v3.session_token);
+        assert!(auth.validate(principal, 0, decoded.session_token, now));
+
+        // A different token still fails, version regardless.
+        assert!(!auth.validate(principal, 0, 0xBAD0_0001, now));
+    }
+
+    #[test]
+    fn test_revoke_sets_finite_grace() {
+        let mut auth = Authenticator::new(true);
+        let principal = ip(1);
+        let now = t0();
+        auth.authorize(principal, 0, 55, now);
+        assert!(auth.validate(principal, 0, 55, now));
+
+        let grace = Duration::from_secs(90);
+        auth.revoke(55, now, grace);
+        assert!(auth.validate(principal, 0, 55, now + Duration::from_secs(89)));
+        assert!(!auth.validate(principal, 0, 55, now + Duration::from_secs(91)));
+    }
+
+    #[test]
+    fn test_auth_disabled() {
+        let auth = Authenticator::new(false);
+        let principal = ip(4);
+        let now = t0();
+        assert!(auth.validate(principal, 0, 0, now));
+        assert!(auth.validate(principal, 1234, 255, now));
+    }
+
+    #[test]
+    fn test_multiple_clients_distinct_principals() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        auth.authorize(ip(1), 0, 10, now);
+        auth.authorize(ip(2), 0, 20, now);
+        assert!(auth.validate(ip(1), 0, 10, now));
+        assert!(auth.validate(ip(2), 0, 20, now));
+        assert!(!auth.validate(ip(1), 0, 20, now));
+        assert_eq!(auth.client_count(), 2);
+    }
+
+    #[test]
+    fn test_generate_token() {
+        let t1 = Authenticator::generate_token();
+        let t2 = Authenticator::generate_token();
+        let _ = (t1, t2);
+    }
+
+    #[test]
+    fn two_nat_clients_same_ip_distinct_tokens_both_validate() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        let shared = ip(1);
+
+        auth.authorize(shared, 40_001, 111, now);
+        auth.authorize(shared, 40_002, 222, now);
+
+        assert!(auth.validate(shared, 40_001, 111, now));
+        assert!(auth.validate(shared, 40_002, 222, now));
+        assert_eq!(auth.client_count(), 2);
+    }
+
+    #[test]
+    fn revoke_one_token_leaves_the_other_valid() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        let shared = ip(1);
+        auth.authorize(shared, 40_001, 111, now);
+        auth.authorize(shared, 40_002, 222, now);
+
+        auth.revoke(222, now, Duration::from_secs(90));
+
+        assert!(auth.validate(shared, 40_001, 111, now + Duration::from_secs(20)));
+        assert!(auth.validate(shared, 40_002, 222, now + Duration::from_secs(89)));
+        assert!(!auth.validate(shared, 40_002, 222, now + Duration::from_secs(91)));
+    }
+
+    #[test]
+    fn previous_token_valid_within_window_then_rejected() {
+        let mut auth = Authenticator::new(true);
+        let shared = ip(1);
+        let t_old = t0();
+        auth.authorize(shared, 40_000, 111, t_old);
+
+        let t_new = t_old + Duration::from_secs(100);
+        auth.authorize(shared, 40_000, 222, t_new);
+
+        let within = t_new + PREVIOUS_TOKEN_GRACE - Duration::from_secs(1);
+        let after = t_new + PREVIOUS_TOKEN_GRACE + Duration::from_secs(1);
+        assert!(auth.validate(shared, 40_000, 111, within));
+        assert!(!auth.validate(shared, 40_000, 111, after));
+        assert!(auth.validate(shared, 40_000, 222, after));
+    }
+
+    #[test]
+    fn rotate_swaps_the_active_token_and_demotes_the_old_one() {
+        let mut auth = Authenticator::new(true);
+        let principal = ip(1);
+        let now = t0();
+        auth.authorize(principal, 40_000, 111, now);
+
+        let new_token = auth
+            .rotate(principal, 111, now)
+            .expect("live token rotates");
+        assert_ne!(new_token, 111, "rotation must issue a fresh token");
+
+        // The fresh token runs for a full TTL while the superseded one is
+        // demoted to the previous-token grace window.
+        assert!(auth.validate(
+            principal,
+            40_000,
+            new_token,
+            now + TOKEN_TTL - Duration::from_secs(1)
+        ));
+        assert!(auth.validate(
+            principal,
+            40_000,
+            111,
+            now + PREVIOUS_TOKEN_GRACE - Duration::from_secs(1)
+        ));
+        assert!(!auth.validate(
+            principal,
+            40_000,
+            111,
+            now + PREVIOUS_TOKEN_GRACE + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn rotate_without_a_registered_token_is_refused() {
+        let mut auth = Authenticator::new(true);
+        let principal = ip(1);
+        let now = t0();
+
+        assert_eq!(
+            auth.rotate(principal, 999, now),
+            None,
+            "unknown token refused"
+        );
+        assert_eq!(auth.client_count(), 0);
+
+        // A token that exists but belongs to another principal is refused too:
+        // presenting it must not mint a token for the caller.
+        auth.authorize(ip(2), 0, 111, now);
+        assert_eq!(
+            auth.rotate(principal, 111, now),
+            None,
+            "foreign token refused"
+        );
+        assert!(auth.validate(ip(2), 0, 111, now));
+        assert_eq!(auth.client_count(), 1);
+    }
+
+    #[test]
+    fn rotated_old_token_is_rejected_after_grace_expiry() {
+        let mut auth = Authenticator::new(true);
+        let principal = ip(1);
+        let now = t0();
+        auth.authorize(principal, 0, 111, now);
+
+        let new_token = auth.rotate(principal, 111, now).unwrap();
+        let expired = now + PREVIOUS_TOKEN_GRACE + Duration::from_secs(1);
+
+        assert!(!auth.validate(principal, 0, 111, expired));
+        assert!(auth.validate(principal, 0, new_token, expired));
+        assert_eq!(auth.sweep(expired), 1, "the demoted token is swept");
+    }
+
+    #[test]
+    fn rotate_obeys_the_fail_closed_table_cap() {
+        let now = t0();
+        let principal = ip(1);
+
+        let mut full = Authenticator::with_max_entries(true, 2);
+        full.authorize(principal, 0, 111, now);
+        full.authorize(ip(2), 0, 222, now);
+        assert_eq!(
+            full.rotate(principal, 111, now),
+            None,
+            "a full table refuses"
+        );
+        assert_eq!(full.client_count(), 2, "a refused rotation adds no entry");
+        assert!(full.validate(principal, 0, 111, now));
+
+        // With a free slot the same rotation succeeds, so it is the table cap
+        // - not a new per-rotation limit - that bounds rotations.
+        let mut roomy = Authenticator::with_max_entries(true, 2);
+        roomy.authorize(principal, 0, 111, now);
+        let fresh = roomy.rotate(principal, 111, now).expect("room to rotate");
+        assert!(roomy.validate(principal, 0, fresh, now));
+        assert_eq!(roomy.client_count(), 2);
+    }
+
+    #[test]
+    fn token_from_different_principal_rejected() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        auth.authorize(ip(1), 0, 111, now);
+        assert!(!auth.validate(ip(2), 0, 111, now));
+    }
+
+    #[test]
+    fn bound_port_mismatch_rejected() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        auth.authorize(ip(1), 40_000, 111, now);
+
+        assert!(auth.validate(ip(1), 40_000, 111, now));
+        assert!(!auth.validate(ip(1), 40_001, 111, now));
+        // A zero data port means "no port binding was ever established".
+        assert!(!auth.validate(ip(1), 0, 111, now));
+    }
+
+    #[test]
+    fn sweep_drops_expired_entries() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        auth.authorize(ip(1), 0, 111, now);
+        auth.authorize(ip(2), 0, 222, now);
+
+        auth.sweep(now + TOKEN_TTL - Duration::from_secs(1));
+        assert_eq!(auth.client_count(), 2);
+
+        auth.sweep(now + TOKEN_TTL + Duration::from_secs(1));
+        assert_eq!(auth.client_count(), 0);
+        assert!(!auth.validate(ip(1), 0, 111, now + TOKEN_TTL + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn refresh_keeps_open_connection_valid() {
+        let mut auth = Authenticator::new(true);
+        let principal = ip(1);
+        let now = t0();
+        auth.authorize(principal, 0, 111, now);
+
+        let refreshed_at = now + Duration::from_secs(250);
+        auth.refresh(111, refreshed_at);
+
+        let past_original_ttl = now + TOKEN_TTL + Duration::from_secs(10);
+        assert!(auth.validate(principal, 0, 111, past_original_ttl));
+        assert!(auth.validate(
+            principal,
+            0,
+            111,
+            refreshed_at + TOKEN_TTL - Duration::from_secs(1)
+        ));
+        assert!(!auth.validate(
+            principal,
+            0,
+            111,
+            refreshed_at + TOKEN_TTL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn ban_removes_principal_entries_immediately() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        auth.authorize(ip(1), 0, 111, now);
+        auth.authorize(ip(1), 0, 222, now);
+        auth.authorize(ip(2), 0, 333, now);
+
+        auth.ban(ip(1));
+
+        assert!(!auth.validate(ip(1), 0, 111, now));
+        assert!(!auth.validate(ip(1), 0, 222, now));
+        assert!(auth.validate(ip(2), 0, 333, now));
+        assert_eq!(auth.client_count(), 1);
+    }
+
+    #[test]
+    fn authorize_fails_closed_when_table_full() {
+        let mut auth = Authenticator::with_max_entries(true, 2);
+        let now = t0();
+        auth.authorize(ip(1), 0, 111, now);
+        auth.authorize(ip(2), 0, 222, now);
+
+        auth.authorize(ip(3), 0, 333, now);
+        assert!(!auth.validate(ip(3), 0, 333, now));
+        assert_eq!(auth.client_count(), 2);
+
+        auth.authorize(ip(1), 0, 111, now + Duration::from_secs(1));
+        assert_eq!(auth.client_count(), 2);
+    }
+
+    #[test]
+    fn nat_peers_distinct_ports_do_not_demote_each_other() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        let shared = ip(1);
+
+        auth.authorize(shared, 40_001, 111, now);
+        // A second client behind the same NAT registers later on another port.
+        let later = now + Duration::from_secs(200);
+        auth.authorize(shared, 40_002, 222, later);
+
+        // The first client keeps its full TTL, not the shorter previous-token
+        // grace window that a same-principal demotion would impose.
+        let past_grace = now + PREVIOUS_TOKEN_GRACE + Duration::from_secs(1);
+        assert!(auth.validate(shared, 40_001, 111, past_grace));
+        assert!(auth.validate(
+            shared,
+            40_001,
+            111,
+            now + TOKEN_TTL - Duration::from_secs(1)
+        ));
+        assert!(!auth.validate(
+            shared,
+            40_001,
+            111,
+            now + TOKEN_TTL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn principal_only_registration_demotes_nothing() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        let shared = ip(1);
+
+        auth.authorize(shared, 40_001, 111, now);
+        auth.authorize(shared, 0, 222, now);
+
+        assert!(auth.validate(
+            shared,
+            40_001,
+            111,
+            now + PREVIOUS_TOKEN_GRACE + Duration::from_secs(1)
+        ));
+    }
+
+    fn snap(
+        token: u32,
+        principal: &str,
+        bound_port: u16,
+        ttl_ms_remaining: u64,
+    ) -> AuthTokenSnapshot {
+        AuthTokenSnapshot {
+            token,
+            principal: principal.to_string(),
+            bound_port,
+            ttl_ms_remaining,
+        }
+    }
+
+    #[test]
+    fn snapshot_drops_expired_and_preserves_remaining_ttl() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        auth.authorize(ip(1), 40_001, 111, now);
+        auth.authorize(ip(2), 0, 222, now);
+        auth.revoke(222, now, Duration::from_secs(5));
+
+        let snapshots = auth.snapshot(now + Duration::from_secs(100));
+
+        assert_eq!(snapshots.len(), 1, "expired token must be dropped");
+        let entry = &snapshots[0];
+        assert_eq!(entry.token, 111);
+        assert_eq!(entry.principal, "10.0.0.1");
+        assert_eq!(entry.bound_port, 40_001);
+        assert_eq!(entry.ttl_ms_remaining, 200_000);
+    }
+
+    #[test]
+    fn snapshot_reports_zero_port_for_principal_only_tokens() {
+        let mut auth = Authenticator::new(true);
+        let now = t0();
+        auth.authorize(ip(3), 0, 333, now);
+
+        let snapshots = auth.snapshot(now);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].bound_port, 0);
+    }
+
+    #[test]
+    fn restore_reproduces_validation_at_the_original_deadline() {
+        let mut source = Authenticator::new(true);
+        let t0 = Instant::now();
+        source.authorize(ip(1), 40_001, 111, t0);
+        let snapshots = source.snapshot(t0 + Duration::from_secs(60));
+
+        let mut restored = Authenticator::new(true);
+        let restored_at = t0 + Duration::from_secs(120);
+        restored.restore(&snapshots, restored_at);
+
+        assert!(restored.validate(ip(1), 40_001, 111, restored_at + Duration::from_secs(239)));
+        assert!(!restored.validate(ip(1), 40_001, 111, restored_at + Duration::from_secs(241)));
+        assert!(!restored.validate(ip(2), 40_001, 111, restored_at));
+        assert!(!restored.validate(ip(1), 40_002, 111, restored_at));
+    }
+
+    #[test]
+    fn restore_preserves_the_fail_closed_cap() {
+        let mut restored = Authenticator::with_max_entries(true, 1);
+        let now = t0();
+        restored.restore(
+            &[
+                snap(111, "10.0.0.1", 0, 1_000),
+                snap(222, "10.0.0.2", 0, 1_000),
+            ],
+            now,
+        );
+
+        assert_eq!(restored.client_count(), 1);
+        assert!(restored.validate(ip(1), 0, 111, now));
+        assert!(!restored.validate(ip(2), 0, 222, now));
+    }
+
+    #[test]
+    fn restore_skips_unparseable_principals() {
+        let mut restored = Authenticator::new(true);
+        let now = t0();
+        restored.restore(&[snap(111, "not-an-ip", 0, 1_000)], now);
+
+        assert_eq!(restored.client_count(), 0);
+    }
+}

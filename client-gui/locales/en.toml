@@ -1,0 +1,181 @@
+# LightSpeed GUI - source locale (English).
+#
+# This file is the source of truth: every user-visible string in the GUI lives
+# here, and every other locale is a translation of this key set. Keys are
+# dotted and grouped by the screen that renders them.
+#
+# The key set must be identical across catalogs, which
+# `every_shipped_locale_matches_the_source_key_set` enforces - the source locale
+# (`en.toml`) is the authority on which keys exist.
+#
+# Rules for translators (and for the tests in src/i18n.rs):
+#   - Keep keys identical across files; translate values only.
+#   - `{name}` placeholders must survive; they are substituted at render time.
+#   - Use "..." (three ASCII dots) where the source does; the GUI renders the
+#     ellipsis itself.
+
+[app]
+title = "LightSpeed"
+
+[settings]
+language = "Language"
+follow_system = "System default"
+title = "Settings"
+privacy = "Privacy"
+maintenance = "Maintenance"
+about = "About"
+open_log = "Open log file"
+check_updates_hint = "Check whether a newer version of LightSpeed is available."
+share_stats = "Share anonymous latency stats"
+capture_status = "Capture backend (pcap mode): {state}"
+capture_available = "available"
+capture_missing = "not detected"
+
+[proxies]
+title = "Proxy Manager"
+manage_hint = "Add, remove, or refresh the relay list."
+disconnect_hint = "Drop the control-plane link to the current relay"
+label_field = "Label:"
+addr_field = "Addr:"
+invalid = "invalid"
+addr_invalid_hint = "Enter a valid IP:port (e.g. 1.2.3.4:28015)"
+add = "Add Proxy"
+refresh = "Refresh relays"
+open_config = "Open config folder"
+reset_defaults = "Reset to defaults"
+
+[relay]
+auto_fastest = "Auto (fastest)"
+retry = "Retry"
+refresh_failed = "Relay refresh failed - using the saved list"
+registry_empty = "The relay registry returned no usable relays."
+discovering = "Discovering relays…"
+none_discovered = "No relays discovered"
+select_a_relay = "Select a relay"
+
+[game]
+auto_detect = "Auto (detect)"
+manual_custom = "Manual / Custom…"
+manual_server = "Manual (custom server)"
+auto_named = "Auto — {name}"
+found = "Game found:"
+none_detected = "No game detected"
+none_detected_hint = "No game detected - Auto will follow one when you start it"
+
+target_process = "Target a process"
+target_process_hint = "Pick any running program and LightSpeed relays all of its traffic, even if it is not in the game list."
+target_none = "Relay all traffic from a program you pick."
+target_set = "Target: {target}"
+target_clear = "Clear target"
+my_games = "My games"
+new_custom = "New custom game…"
+editor_title = "Custom game"
+editor_list = "My games"
+editor_edit = "Edit"
+editor_name = "Name:"
+editor_name_hint = "e.g. My Game"
+editor_process_names = "Process names:"
+editor_process_hint = "Comma-separated, e.g. MyGame.exe, Launcher.exe"
+editor_process_picker = "Running processes"
+editor_process_search_hint = "Filter by name or path"
+editor_process_refresh = "Refresh"
+editor_process_loading = "Reading the process list…"
+editor_process_empty = "No running processes were found. Type the name above."
+editor_process_no_match = "No process matches that filter."
+editor_udp_range = "UDP range:"
+editor_udp_hint = "e.g. 27015-27050 (blank to match by process)"
+editor_dynamic_server = "Server rotates between matches"
+editor_notes = "Notes:"
+editor_notes_hint = "Shown in the app; optional"
+editor_name_required = "Give the game a name."
+editor_udp_invalid = "Enter a range like 27015-27050, or a single port."
+editor_process_reserved = "A built-in game already uses one of those process names."
+editor_key_duplicate = "You already have a game with that key."
+editor_target_required = "Add a process name or a UDP range."
+editor_key = "Key: {key} - start the CLI with --game {key}"
+editor_key_underivable = "Give the game a name with a letter or digit to derive its key."
+editor_key_reserved = "'{key}' is reserved by the built-in game {name}"
+editor_save = "Save game"
+editor_delete = "Delete game"
+editor_new_hint = "Custom games live in profiles.toml, next to config.toml."
+editor_saved = "Saved {name} as {key}"
+editor_no_games = "No custom games yet."
+
+[servers]
+saved = "Saved servers:"
+none = "No saved servers"
+save_as = "Save as:"
+save_name_hint = "Name for this server"
+save = "Save server"
+invalid_name = "Name this server before saving"
+invalid_address = "Enter a valid IP:port first"
+saved_notice = "Saved {name}"
+
+[connect]
+rust = "In Rust  F1 console:  client.connect 127.0.0.1:{port}"
+cs2 = "In CS2 console:  connect 127.0.0.1:{port}"
+dota2 = "In Dota 2 console:  connect 127.0.0.1:{port}"
+generic = "Connect your game to:  127.0.0.1:{port}"
+
+[update]
+sheet_title = "Check for updates"
+checking = "Checking for updates…"
+installing = "Installing update…"
+current = "Current version: {version}"
+latest = "Latest version: {version}"
+install = "Install update"
+install_hint = "Download, verify, and install the latest version"
+available = "Update available"
+up_to_date = "You're up to date"
+
+[window]
+hide_to_tray = "Hide to tray"
+
+[about]
+source_hint = "Source code, issues and releases"
+website_hint = "Live relay status, benchmarks and docs"
+star_hint = "Stars help other players find LightSpeed"
+enjoying = "Enjoying it?"
+star_github = "Star it on GitHub"
+version = "Version {version}"
+blurb = "Free and open source, with no accounts and no telemetry you cannot turn off."
+
+[state]
+disconnected = "Disconnected"
+connected = "Connected"
+optimizing = "Optimizing"
+error = "Error"
+idle = "Not optimizing"
+
+[action]
+connect = "Connect"
+disconnect = "Disconnect"
+connecting = "Connecting..."
+quit = "Quit"
+cancel = "Cancel"
+close = "Close"
+stop_optimizing = "Stop optimizing"
+optimize_route = "Optimize my route"
+restart_admin_optimize = "Restart as Administrator to optimize"
+manage = "Manage"
+
+[route]
+target = "Target"
+title = "Route"
+server = "Server"
+server_label = "Server:"
+custom_port_range = "Custom Port Range:"
+port_hint = "e.g. {range} (leave blank for auto)"
+relay = "Relay"
+game = "Game"
+status = "Status"
+no_relay = "No relay yet"
+relay_ready_pick = "Relay ready, pick your game"
+relay_ready_named = "Relay ready, {name} selected"
+game_server = "Game server"
+relayed = "Relayed"
+direct_fallback = "Direct fallback"
+place_hint = "-- start optimizing to place it"
+count_hint = "-- start optimizing to count"
+port_fix_guide = "Port not detected - fix guide"
+start_manual = "Start optimizing (manual)"

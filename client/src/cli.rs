@@ -1,0 +1,671 @@
+//! CLI argument definitions and address parsing helpers.
+
+use std::net::SocketAddrV4;
+
+use clap::Parser;
+
+/// LightSpeed - Reduce your ping. Free. Forever.
+#[derive(Parser, Debug)]
+#[command(name = "lightspeed", version, about, long_about = None)]
+pub struct Cli {
+    /// Path to configuration file
+    #[arg(short, long, default_value = "lightspeed.toml")]
+    pub config: String,
+
+    /// User profiles file (custom games + saved servers). Defaults to the
+    /// per-OS config dir, e.g. %APPDATA%\light-speed\profiles.toml on Windows.
+    #[arg(long, value_name = "PATH")]
+    pub profiles: Option<String>,
+
+    /// Ignore user profiles entirely: built-in games only.
+    #[arg(long, default_value_t = false)]
+    pub no_user_profiles: bool,
+
+    /// Game to optimize (run --list-games for the full list)
+    #[arg(short, long)]
+    pub game: Option<String>,
+
+    /// Proxy server address (host:port). If omitted, auto-selects from config.
+    #[arg(short, long)]
+    pub proxy: Option<String>,
+
+    /// Enable verbose logging
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
+
+    /// Dry run - show what would happen without capturing packets
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Run tunnel test mode - send test packets to verify proxy connectivity
+    #[arg(long, default_value_t = false)]
+    pub test_tunnel: bool,
+
+    /// Test QUIC control plane - connect, register, ping, disconnect
+    #[arg(long, default_value_t = false)]
+    pub test_control: bool,
+
+    /// Game server address (ip:port) - enables redirect mode.
+    /// Traffic to this server is tunneled through the proxy.
+    #[arg(short = 's', long)]
+    pub game_server: Option<String>,
+
+    /// Local port for redirect mode (default: same as game server port)
+    #[arg(long)]
+    pub local_port: Option<u16>,
+
+    /// Enable Forward Error Correction (FEC) for packet loss recovery.
+    /// Adds ~25% bandwidth overhead but can recover any single lost packet
+    /// per block of K. Recovery does not need a retransmission round trip.
+    #[arg(long, default_value_t = false)]
+    pub fec: bool,
+
+    /// FEC block size: number of data packets per parity packet (2-16, default 4).
+    /// Lower K = more redundancy but more overhead. K=4 means 25% overhead.
+    #[arg(long, default_value_t = 4)]
+    pub fec_k: u8,
+
+    /// Use TCP for the client→proxy leg of the tunnel (UDP-restricted networks).
+    #[arg(long, default_value_t = false)]
+    pub tcp: bool,
+
+    /// Mark tunnel packets with DSCP EF (46) so the local router/ISP may
+    /// prioritise them. Opt-in; ignored on Windows.
+    #[arg(long, default_value_t = false)]
+    pub dscp: bool,
+
+    /// Enable adaptive FEC and loss-gated packet duplication. Sends no parity
+    /// on a clean link, returns to low overhead quickly once loss stops, and
+    /// duplicates only while loss or jitter is measured. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub adaptive_fec: bool,
+
+    /// Hard ceiling on adaptive FEC parity overhead, in percent (2-50,
+    /// default 25). Bounds the effective FEC block size.
+    #[arg(long, default_value_t = 25)]
+    pub fec_max_overhead: u32,
+
+    /// Discover the real client→relay path MTU (DPLPMTUD) and raise the tunnel
+    /// payload budget when the path supports it. Off by default; any failure
+    /// falls back to the conservative clamp.
+    #[arg(long, default_value_t = false)]
+    pub path_mtu_discovery: bool,
+
+    /// Enable Cloudflare WARP for improved routing (5-10ms savings).
+    /// Automatically connects WARP on startup and restores on shutdown.
+    #[arg(short = 'w', long, default_value_t = false)]
+    pub warp: bool,
+
+    /// Disable WARP even if previously enabled
+    #[arg(long, default_value_t = false)]
+    pub no_warp: bool,
+
+    /// Show WARP status and exit
+    #[arg(long, default_value_t = false)]
+    pub warp_status: bool,
+
+    /// Route selection strategy: nearest, ml (default: from config or nearest)
+    #[arg(long)]
+    pub route_strategy: Option<String>,
+
+    /// Interception mode: auto, userspace, or kernel.
+    #[arg(long, value_name = "MODE")]
+    pub interception_mode: Option<String>,
+
+    /// Disable the do-no-harm bypass gate: always tunnel through the relay.
+    /// This is the complete rollback; it matches the behaviour before the gate.
+    #[arg(long, default_value_t = false)]
+    pub no_bypass: bool,
+
+    /// Force the direct path for every session. Testing only: on Linux and
+    /// macOS this means the redirect rule is not installed at all.
+    #[arg(long, default_value_t = false)]
+    pub force_direct: bool,
+
+    /// Run the bypass gate in dry-run: measure and log the decision, change
+    /// nothing. This is already the built-in default.
+    #[arg(long, default_value_t = false)]
+    pub bypass_dry_run: bool,
+
+    /// Probe all configured proxies and display latencies, then exit
+    #[arg(long, default_value_t = false)]
+    pub probe_proxies: bool,
+
+    /// Community registry URL (signed node list) for proxy discovery.
+    /// When set with --probe-proxies, the registry's nodes are probed too.
+    #[arg(long)]
+    pub registry: Option<String>,
+
+    /// Run comprehensive live integration test against configured proxies.
+    /// Tests health, route selection, keepalive echo, data relay, and FEC.
+    #[arg(long, default_value_t = false)]
+    pub live_test: bool,
+
+    /// Echo server address for live data relay testing (e.g., YOUR_PROXY_IP:9999).
+    /// Required for data relay and FEC phases of --live-test.
+    #[arg(long)]
+    pub echo_server: Option<String>,
+
+    /// List available network interfaces for packet capture, then exit.
+    #[arg(long, default_value_t = false)]
+    pub list_interfaces: bool,
+    /// List supported games with their default ports, then exit.
+    #[arg(long, default_value_t = false)]
+    pub list_games: bool,
+
+    /// Write a default lightspeed.toml config file to the current directory.
+    #[arg(long, default_value_t = false)]
+    pub write_config: bool,
+
+    /// Run environment checks (nftables/iptables, proxy, game detection).
+    /// Exits 0 if all pass, 1 otherwise.
+    #[arg(long, default_value_t = false)]
+    pub check: bool,
+
+    /// Show detailed system state (OS, interceptor, games, nftables rules).
+    #[arg(long, default_value_t = false)]
+    pub status: bool,
+
+    /// Run an interactive demonstration of LightSpeed architecture and latency projections.
+    #[arg(long, default_value_t = false)]
+    pub demo: bool,
+
+    /// Run a full E2E smoke test (starts echo server + interceptor).
+    /// Validates the entire pipeline. Requires root for nftables.
+    #[arg(long, default_value_t = false)]
+    pub smoke_test: bool,
+
+    /// Watch for game process and auto-start interceptor when detected.
+    /// Requires --game and --proxy. Ctrl+C to stop.
+    #[arg(long, default_value_t = false)]
+    pub watch: bool,
+
+    /// Run latency benchmark comparing direct vs LightSpeed routing.
+    /// Requires --target and --proxy.
+    #[arg(long, default_value_t = false)]
+    pub benchmark: bool,
+
+    /// Target server for --benchmark (ip:port).
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Diagnose whether the relay helps for one game server, then exit.
+    /// Measures the direct (ICMP) and relayed (tunnelled) path over a short
+    /// bounded window and prints a plain saved/not-helped verdict. Uses
+    /// --target, or the running game's server, and never reports telemetry.
+    #[arg(long, default_value_t = false)]
+    pub diagnose: bool,
+
+    /// Enable pcap capture mode (alternative to redirect mode).
+    /// Captures game packets directly from the network interface.
+    /// Requires the pcap-capture feature and elevated privileges.
+    #[arg(long, default_value_t = false)]
+    pub capture: bool,
+
+    /// Network interface for capture mode (e.g., "eth0", "Ethernet").
+    /// If omitted, uses the system default interface.
+    #[arg(long)]
+    pub interface: Option<String>,
+
+    /// Run the OOP TrafficInterceptor in test mode.
+    /// Discovers the game process via ProcessScanner and reports the
+    /// available interceptor backend, discovered routes, and availability.
+    /// Does not start the interceptor (use --game + redirect mode for that).
+    #[arg(long, default_value_t = false)]
+    pub intercept: bool,
+
+    /// Start the OOP TrafficInterceptor in live MITM mode.
+    /// Requires --game and --proxy. Installs kernel-level redirect rules
+    /// (nftables/iptables/pfctl/WinDivert) and tunnels game traffic.
+    /// Press Ctrl+C to stop and clean up firewall rules.
+    /// Requires elevated privileges: root on Linux/macOS, Admin on Windows.
+    #[arg(long, default_value_t = false)]
+    pub start_interceptor: bool,
+
+    /// Override the game server address for interceptor mode.
+    /// Useful for testing when the game is not running.
+    /// Format: ip:port (e.g., 1.2.3.4:28015)
+    #[arg(long)]
+    pub server_addr: Option<String>,
+
+    /// Scan for game processes and display their UDP routes, then exit.
+    /// Useful for debugging game detection before starting the interceptor.
+    #[arg(long, default_value_t = false)]
+    pub scan_processes: bool,
+
+    /// Prove that a game profile captures, attributes and relays that game's own
+    /// traffic. Prints a human report and exits 1 when the profile fails.
+    #[arg(long, value_name = "GAME")]
+    pub verify_game: Option<String>,
+
+    /// Seconds to capture during --verify-game. 0 skips the live stage.
+    #[arg(long, default_value_t = 30)]
+    pub verify_seconds: u64,
+
+    /// Write the --verify-game report as JSON to this path.
+    #[arg(long, value_name = "PATH")]
+    pub verify_report: Option<String>,
+
+    /// Share anonymous aggregate latency stats (on by default).
+    /// Sends p50/p95/p99 RTT, jitter, and FEC counters to the relay every
+    /// 15 minutes. No IP address, identifier, or packet content is ever sent,
+    /// and cells with fewer than 3 reports are suppressed. See docs/privacy.md.
+    #[arg(long, default_value_t = false)]
+    pub telemetry: bool,
+
+    /// Disable telemetry even though it is on by default (overrides config).
+    #[arg(long, default_value_t = false)]
+    pub no_telemetry: bool,
+}
+
+/// Parse a proxy address string into `SocketAddrV4`.
+///
+/// Accepts `ip:port` directly or performs DNS resolution for `host:port`.
+pub fn parse_proxy_addr(s: &str) -> anyhow::Result<SocketAddrV4> {
+    // Try parsing as ip:port first (fast path)
+    if let Ok(addr) = s.parse::<SocketAddrV4>() {
+        return Ok(addr);
+    }
+    // Fall back to DNS resolution for hostname:port
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<_> = s.to_socket_addrs()?.collect();
+    for addr in &addrs {
+        if let std::net::SocketAddr::V4(v4) = addr {
+            return Ok(*v4);
+        }
+    }
+    anyhow::bail!("Could not resolve proxy address: {}", s);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_default_values() {
+        let cli = Cli::try_parse_from(["lightspeed"]).unwrap();
+        assert_eq!(cli.config, "lightspeed.toml");
+        assert!(cli.profiles.is_none());
+        assert!(!cli.no_user_profiles);
+        assert!(!cli.verbose);
+        assert!(!cli.dry_run);
+        assert!(!cli.test_tunnel);
+        assert!(!cli.test_control);
+        assert!(!cli.fec);
+        assert_eq!(cli.fec_k, 4);
+        assert!(!cli.tcp);
+        assert!(!cli.dscp);
+        assert!(!cli.adaptive_fec);
+        assert_eq!(cli.fec_max_overhead, 25);
+        assert!(!cli.warp);
+        assert!(!cli.no_warp);
+        assert!(!cli.warp_status);
+        assert!(!cli.probe_proxies);
+        assert!(!cli.live_test);
+        assert!(!cli.list_interfaces);
+        assert!(!cli.list_games);
+        assert!(!cli.write_config);
+        assert!(!cli.check);
+        assert!(!cli.status);
+        assert!(!cli.demo);
+        assert!(!cli.smoke_test);
+        assert!(!cli.watch);
+        assert!(!cli.benchmark);
+        assert!(!cli.diagnose);
+        assert!(!cli.capture);
+        assert!(!cli.intercept);
+        assert!(!cli.start_interceptor);
+        assert!(!cli.scan_processes);
+        assert!(!cli.telemetry);
+        assert!(!cli.no_telemetry);
+        assert!(!cli.no_bypass);
+        assert!(!cli.force_direct);
+        assert!(!cli.bypass_dry_run);
+        assert!(cli.game.is_none());
+        assert!(cli.proxy.is_none());
+        assert!(cli.game_server.is_none());
+        assert!(cli.local_port.is_none());
+        assert!(cli.route_strategy.is_none());
+        assert!(cli.interception_mode.is_none());
+        assert!(cli.echo_server.is_none());
+        assert!(cli.interface.is_none());
+    }
+
+    #[test]
+    fn test_dscp_flag_is_opt_in() {
+        let cli = Cli::try_parse_from(["lightspeed", "--dscp"]).unwrap();
+        assert!(cli.dscp);
+    }
+
+    #[test]
+    fn test_short_flags() {
+        let cli = Cli::try_parse_from(["lightspeed", "-v"]).unwrap();
+        assert!(cli.verbose);
+
+        let cli = Cli::try_parse_from(["lightspeed", "-g", "fortnite"]).unwrap();
+        assert_eq!(cli.game.as_deref(), Some("fortnite"));
+
+        let cli = Cli::try_parse_from(["lightspeed", "-p", "10.0.0.1:4434"]).unwrap();
+        assert_eq!(cli.proxy.as_deref(), Some("10.0.0.1:4434"));
+
+        let cli = Cli::try_parse_from(["lightspeed", "-s", "192.168.1.1:27015"]).unwrap();
+        assert_eq!(cli.game_server.as_deref(), Some("192.168.1.1:27015"));
+
+        let cli = Cli::try_parse_from(["lightspeed", "-w"]).unwrap();
+        assert!(cli.warp);
+    }
+
+    #[test]
+    fn test_long_flags() {
+        let cli = Cli::try_parse_from([
+            "lightspeed",
+            "--verbose",
+            "--dry-run",
+            "--test-tunnel",
+            "--test-control",
+            "--fec",
+            "--no-warp",
+            "--warp-status",
+            "--probe-proxies",
+            "--live-test",
+            "--list-interfaces",
+            "--list-games",
+            "--write-config",
+            "--check",
+            "--status",
+            "--demo",
+            "--smoke-test",
+            "--watch",
+            "--benchmark",
+            "--diagnose",
+            "--capture",
+            "--intercept",
+            "--start-interceptor",
+            "--scan-processes",
+            "--telemetry",
+            "--no-telemetry",
+            "--no-bypass",
+            "--force-direct",
+            "--bypass-dry-run",
+            "--adaptive-fec",
+            "--no-user-profiles",
+        ])
+        .unwrap();
+        assert!(cli.verbose);
+        assert!(cli.dry_run);
+        assert!(cli.test_tunnel);
+        assert!(cli.test_control);
+        assert!(cli.fec);
+        assert!(cli.no_warp);
+        assert!(cli.warp_status);
+        assert!(cli.probe_proxies);
+        assert!(cli.live_test);
+        assert!(cli.list_interfaces);
+        assert!(cli.list_games);
+        assert!(cli.write_config);
+        assert!(cli.check);
+        assert!(cli.status);
+        assert!(cli.demo);
+        assert!(cli.smoke_test);
+        assert!(cli.watch);
+        assert!(cli.benchmark);
+        assert!(cli.diagnose);
+        assert!(cli.capture);
+        assert!(cli.intercept);
+        assert!(cli.start_interceptor);
+        assert!(cli.scan_processes);
+        assert!(cli.telemetry);
+        assert!(cli.no_telemetry);
+        assert!(cli.no_bypass);
+        assert!(cli.force_direct);
+        assert!(cli.bypass_dry_run);
+        assert!(cli.adaptive_fec);
+        assert!(cli.no_user_profiles);
+    }
+
+    #[test]
+    fn test_profile_flags() {
+        let cli = Cli::try_parse_from(["lightspeed"]).unwrap();
+        assert!(cli.profiles.is_none());
+        assert!(!cli.no_user_profiles);
+
+        let cli =
+            Cli::try_parse_from(["lightspeed", "--profiles", "custom/profiles.toml"]).unwrap();
+        assert_eq!(cli.profiles.as_deref(), Some("custom/profiles.toml"));
+        assert!(!cli.no_user_profiles);
+
+        let cli = Cli::try_parse_from([
+            "lightspeed",
+            "--profiles",
+            "custom/profiles.toml",
+            "--no-user-profiles",
+        ])
+        .unwrap();
+        assert!(cli.no_user_profiles);
+    }
+
+    #[test]
+    fn test_bypass_flags() {
+        let cli = Cli::try_parse_from(["lightspeed"]).unwrap();
+        assert!(!cli.no_bypass && !cli.force_direct && !cli.bypass_dry_run);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--no-bypass"]).unwrap();
+        assert!(cli.no_bypass);
+        assert!(!cli.force_direct);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--force-direct"]).unwrap();
+        assert!(cli.force_direct);
+        assert!(!cli.no_bypass);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--bypass-dry-run"]).unwrap();
+        assert!(cli.bypass_dry_run);
+    }
+
+    #[test]
+    fn test_long_flags_with_values() {
+        let cli = Cli::try_parse_from([
+            "lightspeed",
+            "--config",
+            "custom.toml",
+            "--profiles",
+            "profiles.toml",
+            "--game",
+            "cs2",
+            "--proxy",
+            "10.0.0.1:4434",
+            "--game-server",
+            "1.2.3.4:7777",
+            "--local-port",
+            "8888",
+            "--fec-k",
+            "8",
+            "--fec-max-overhead",
+            "50",
+            "--route-strategy",
+            "ml",
+            "--interception-mode",
+            "userspace",
+            "--echo-server",
+            "10.0.0.1:9999",
+            "--interface",
+            "eth0",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, "custom.toml");
+        assert_eq!(cli.profiles.as_deref(), Some("profiles.toml"));
+        assert_eq!(cli.game.as_deref(), Some("cs2"));
+        assert_eq!(cli.proxy.as_deref(), Some("10.0.0.1:4434"));
+        assert_eq!(cli.game_server.as_deref(), Some("1.2.3.4:7777"));
+        assert_eq!(cli.local_port, Some(8888));
+        assert_eq!(cli.fec_k, 8);
+        assert_eq!(cli.fec_max_overhead, 50);
+        assert_eq!(cli.route_strategy.as_deref(), Some("ml"));
+        assert_eq!(cli.interception_mode.as_deref(), Some("userspace"));
+        assert_eq!(cli.echo_server.as_deref(), Some("10.0.0.1:9999"));
+        assert_eq!(cli.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn test_game_values() {
+        for game in &["fortnite", "cs2", "dota2", "rust"] {
+            let cli = Cli::try_parse_from(["lightspeed", "-g", game]).unwrap();
+            assert_eq!(cli.game.as_deref(), Some(*game));
+        }
+    }
+
+    #[test]
+    fn test_fec_k_boundaries() {
+        // default is 4
+        let cli = Cli::try_parse_from(["lightspeed"]).unwrap();
+        assert_eq!(cli.fec_k, 4);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--fec-k", "2"]).unwrap();
+        assert_eq!(cli.fec_k, 2);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--fec-k", "16"]).unwrap();
+        assert_eq!(cli.fec_k, 16);
+    }
+
+    #[test]
+    fn test_combined_mode_flags() {
+        // Redirect mode with game server
+        let cli = Cli::try_parse_from([
+            "lightspeed",
+            "-g",
+            "fortnite",
+            "-s",
+            "10.0.0.1:7777",
+            "--fec",
+            "--warp",
+            "--route-strategy",
+            "nearest",
+        ])
+        .unwrap();
+        assert_eq!(cli.game.as_deref(), Some("fortnite"));
+        assert_eq!(cli.game_server.as_deref(), Some("10.0.0.1:7777"));
+        assert!(cli.fec);
+        assert!(cli.warp);
+        assert_eq!(cli.route_strategy.as_deref(), Some("nearest"));
+    }
+
+    #[test]
+    fn test_capture_mode() {
+        let cli = Cli::try_parse_from([
+            "lightspeed",
+            "-g",
+            "cs2",
+            "--capture",
+            "--interface",
+            "Ethernet",
+        ])
+        .unwrap();
+        assert_eq!(cli.game.as_deref(), Some("cs2"));
+        assert!(cli.capture);
+        assert_eq!(cli.interface.as_deref(), Some("Ethernet"));
+    }
+
+    #[test]
+    fn test_live_test_mode() {
+        let cli = Cli::try_parse_from([
+            "lightspeed",
+            "--live-test",
+            "--echo-server",
+            "10.0.0.1:9999",
+            "--proxy",
+            "10.0.0.1:4434",
+        ])
+        .unwrap();
+        assert!(cli.live_test);
+        assert_eq!(cli.echo_server.as_deref(), Some("10.0.0.1:9999"));
+        assert_eq!(cli.proxy.as_deref(), Some("10.0.0.1:4434"));
+    }
+
+    #[test]
+    fn test_warp_flags() {
+        let cli = Cli::try_parse_from(["lightspeed", "-w"]).unwrap();
+        assert!(cli.warp);
+        assert!(!cli.no_warp);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--no-warp"]).unwrap();
+        assert!(!cli.warp);
+        assert!(cli.no_warp);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--warp-status"]).unwrap();
+        assert!(cli.warp_status);
+    }
+
+    #[test]
+    fn test_telemetry_flags() {
+        let cli = Cli::try_parse_from(["lightspeed", "--telemetry"]).unwrap();
+        assert!(cli.telemetry);
+        assert!(!cli.no_telemetry);
+
+        let cli = Cli::try_parse_from(["lightspeed", "--no-telemetry"]).unwrap();
+        assert!(!cli.telemetry);
+        assert!(cli.no_telemetry);
+    }
+
+    #[test]
+    fn test_route_strategies() {
+        for strategy in &["nearest", "ml", "multipath"] {
+            let cli = Cli::try_parse_from(["lightspeed", "--route-strategy", strategy]).unwrap();
+            assert_eq!(cli.route_strategy.as_deref(), Some(*strategy));
+        }
+    }
+
+    #[test]
+    fn test_interception_mode_flag() {
+        let cli = Cli::try_parse_from(["lightspeed"]).unwrap();
+        assert!(cli.interception_mode.is_none());
+
+        let cli = Cli::try_parse_from(["lightspeed", "--interception-mode", "userspace"]).unwrap();
+        assert_eq!(cli.interception_mode.as_deref(), Some("userspace"));
+    }
+
+    // ── parse_proxy_addr tests ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_proxy_addr_ipv4() {
+        let addr = parse_proxy_addr("192.168.1.1:4434").unwrap();
+        assert_eq!(addr.ip().octets(), [192, 168, 1, 1]);
+        assert_eq!(addr.port(), 4434);
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_loopback() {
+        let addr = parse_proxy_addr("127.0.0.1:8080").unwrap();
+        assert_eq!(addr.ip().octets(), [127, 0, 0, 1]);
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_invalid_ip() {
+        let result = parse_proxy_addr("not-an-ip:4434");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_missing_port() {
+        let result = parse_proxy_addr("192.168.1.1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_invalid_port() {
+        let result = parse_proxy_addr("192.168.1.1:99999");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_empty() {
+        let result = parse_proxy_addr("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_garbage() {
+        let result = parse_proxy_addr("garbage");
+        assert!(result.is_err());
+    }
+}

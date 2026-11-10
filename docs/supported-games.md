@@ -1,0 +1,146 @@
+# Supported Games
+
+LightSpeed includes built-in profiles for 24 popular multiplayer games. Each profile defines the UDP port range and process name for auto-detection.
+
+---
+
+## Game List
+
+| # | Game | CLI Flag | Default Ports | Anti-Cheat | Process Name |
+|---|------|----------|---------------|------------|-------------|
+| 1 | **Rust** | `--game rust` | 28015-28017 | EAC | `RustClient.exe` |
+| 2 | **CS2** | `--game cs2` | 27015-27050 | VAC | `cs2.exe` |
+| 3 | **Fortnite** | `--game fortnite` | 7000-9000 | EAC + BattlEye | `FortniteClient-Win64-Shipping.exe` |
+| 4 | **Dota 2** | `--game dota2` | 27015-27050 | VAC | `dota2.exe` |
+| 5 | **Apex Legends** | `--game apex` | 37000-37050 | EAC | `r5apex.exe` |
+| 6 | **Valorant** | `--game valorant` | 7000-7500 | Riot Vanguard | `VALORANT-Win64-Shipping.exe` |
+| 7 | **Overwatch 2** | `--game ow2` | 3478-6250 | Blizzard Warden | `Overwatch.exe` |
+| 8 | **League of Legends** | `--game lol` | 5000-5500 | Riot Vanguard | `League of Legends.exe` |
+| 9 | **PUBG: Battlegrounds** | `--game pubg` | 7000-17999 | BattlEye | `TslGame.exe` |
+| 10 | **MapleStory** | `--game maplestory` | 7575-8484 | BlackCipher (NGS) | `MapleStory.exe` |
+| 11 | **Genshin Impact** | `--game genshin` | 22101-42472 | None | `GenshinImpact.exe` |
+| 12 | **Rocket League** | `--game rocketleague` | 7000-9000 | EAC | `RocketLeague.exe` |
+| 13 | **World of Tanks** | `--game wot` | 12000-29999 | None | `WorldOfTanks.exe` |
+| 14 | **Dead by Daylight** | `--game deadbydaylight` | 27000-27050 | EAC | `DeadByDaylight-Win64-Shipping.exe` |
+| 15 | **Bodycam** | `--game bodycam` | 27000-27050 | None | `Bodycam-Win64-Shipping.exe` |
+| 16 | **CS:GO Legacy** | `--game csgo` | 27000-27050 | VAC | `csgo.exe` |
+| 17 | **Roblox** | `--game roblox` | 49152-65535 | Byfron (Hyperion) | `RobloxPlayerBeta.exe` |
+| 18 | **Project Zomboid** | `--game zomboid` | 16261-16262 | None | `ProjectZomboid64.exe` |
+| 19 | **WARDOGS** | `--game wardogs` | 7777-7788 | Elytra (kernel-mode) | `WardogsClient-Win64-Shipping.exe` |
+| 20 | **Minecraft** | `--game minecraft` | 19132-19133 | None | `Minecraft.Windows.exe` |
+| 21 | **Hunt: Showdown** | `--game hunt` | 20000-20099 | Easy Anti-Cheat (EAC) | `HuntGame.exe` |
+| 22 | **Rainbow Six Siege** | `--game rainbowsix` | 10000-10099 | BattlEye + R6 Shieldguard | `RainbowSix.exe` |
+| 23 | **Dead by Daylight** | `--game deadbydaylight` | 21845-24000 | Easy Anti-Cheat | `DeadByDaylight-Win64-Shipping.exe` |
+| 24 | **ARC Raiders** | `--game arcraiders` | 7600-7777 | Easy Anti-Cheat | `PioneerGame.exe` |
+
+> **Rainbow Six Siege note:** the profile is **UNVERIFIED against R6
+> Shieldguard.** Siege ships three anti-cheat layers - BattlEye, Shieldguard and
+> Ubisoft's account-level system - and Shieldguard refuses to launch unless
+> Secure Boot, HVCI and a TPM 2.0 are present. LightSpeed forwards UDP without
+> injecting code or touching game memory, so it is outside what those systems
+> inspect, but Shieldguard's checks are launch-time *environment* checks rather
+> than network inspection, and nobody has reported a real match run through this
+> profile yet. Aliases: `r6`, `r6s`, `siege`, `rainbow-six`.
+
+> **Hunt: Showdown note:** the UDP gameplay block is 20000-20099, which is
+> what the tunnel carries. The game also opens TCP **61088** for its
+> backend/menu connection; that port is deliberately NOT part of the profile,
+> because LightSpeed captures and tunnels UDP only and a TCP port in the
+> capture range would produce a filter that matches nothing.
+
+> **Roblox note:** Roblox has no native Linux client. On Linux, run it through
+> Wine/Proton, where the process name may appear truncated. Roblox picks its
+> outbound UDP source port from the high ephemeral range (49152-65535) per
+> server instance, so capture/intercept mode works better than redirect mode.
+
+> **WARDOGS note:** Bulkhead has not published a client port list, and the
+> dedicated server binds an operator-chosen `-port`, so the 7777-7788 range is
+> an unverified third-party observation (Unreal's default is 7777). Confirm it
+> with a packet capture. WARDOGS is Windows-only for now: its kernel-level
+> Elytra anti-cheat blocks Proton on Linux, so capture must run on Windows.
+
+---
+
+## TCP-only games (not supported)
+
+LightSpeed accelerates **UDP game traffic only**. Its interceptor and tunnel operate on UDP, so a title whose gameplay runs entirely over TCP cannot be accelerated yet.
+
+A known example is **Angels Online Global**, which uses TCP ports 38201, 38304, 38501, and 38502 with the process `angel.dat`. Because that traffic is TCP, LightSpeed cannot route it. This is a protocol limitation, not a per-game setting.
+
+If a game uses UDP for gameplay and TCP only for login or patching, LightSpeed can still accelerate the UDP gameplay traffic. If the gameplay itself is TCP-only, it is out of scope for now.
+
+---
+
+## Community requests under evaluation
+
+The following titles have been requested by the community and are under evaluation:
+
+- Battlefield 6
+- Warface
+- Delta Force
+
+These are requests only. No support is promised, and no port ranges or anti-cheat compatibility claims are made for them at this time. If and when a profile ships, it will appear in the game list above.
+
+---
+
+## Anti-Cheat Compatibility
+
+LightSpeed is compatible with all major anti-cheat systems:
+
+| System | Games | Status |
+|--------|-------|--------|
+| **EasyAntiCheat (EAC)** | Rust, Fortnite, Apex Legends, Rocket League, Dead by Daylight | ✅ Permitted |
+| **Valve Anti-Cheat (VAC)** | CS2, CS:GO Legacy, Dota 2 | ✅ Permitted |
+| **BattlEye** | Fortnite, PUBG | ✅ Permitted |
+| **Riot Vanguard** | Valorant, League of Legends | ✅ Permitted |
+| **Blizzard Warden** | Overwatch 2 | ✅ Permitted |
+| **Nexon Game Security (NGS)** | MapleStory | ✅ Permitted |
+| **Byfron (Hyperion)** | Roblox | ✅ Permitted |
+| **Elytra (VAIIYA)** | WARDOGS | ✅ Permitted |
+
+LightSpeed uses standard OS-level network drivers (WinDivert, nftables, pfctl). It does **not**:
+- Modify game files or memory
+- Hook into game processes
+- Bypass kernel-level anti-cheat protection
+- Hide or spoof your IP address (game servers see your real IP)
+
+---
+
+## Requesting a New Game
+
+To request official support for a game not listed above:
+
+1. [Open a GitHub issue](https://github.com/ShibbityShwab/lightspeed/issues/new?template=game_request.md)
+2. Include the game name, default UDP port range, and anti-cheat system
+3. If known, include the process name (Windows) or binary name (Linux/macOS)
+
+---
+
+## Manual Server Mode (Any Game)
+
+If your game isn't in the list or uses non-standard ports, use manual server mode:
+
+```bash
+# Find your server's IP and port (check in-game console or netstat)
+# Then run:
+lightspeed --game-server SERVER_IP:PORT --proxy YOUR_PROXY:4434
+
+# Or with a specific local port:
+lightspeed --game-server SERVER_IP:PORT --local-port 28015 --proxy YOUR_PROXY:4434
+```
+
+Then configure your game to connect to `127.0.0.1:<local_port>`.
+
+### Finding Your Game Server Port
+
+**Linux/macOS:**
+```bash
+ss -unp | grep <game_binary_name>
+```
+
+**Windows (PowerShell as Admin):**
+```powershell
+Get-NetUDPEndpoint -OwningProcess (Get-Process RustClient).Id |
+  Where-Object LocalPort -gt 1024 |
+  Select-Object LocalPort, RemoteAddress, RemotePort
+```

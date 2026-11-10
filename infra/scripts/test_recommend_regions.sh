@@ -1,0 +1,748 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+# LightSpeed - Self-test for recommend-regions.sh
+#
+# Proves the load-bearing behaviours of the relay placement
+# recommender:
+#   (1) empty/missing history -> INSUFFICIENT_DATA, exit 0, valid JSON
+#   (2) 25 sessions in one kept cell -> status OK, non-empty ranking
+#   (3) a dominant (>=40%) leader -> ADD
+#   (4) a 5% leader with no stability history -> NONE
+#   (5) three prior identical runs -> ADD via the stability streak
+#   (6) MOVE is gated on stability_runs: 2 consecutive runs -> NONE,
+#       3 consecutive runs -> MOVE
+#   (7) a relay reset flag treats the current cumulative geo count as
+#       the delta (not current - previous)
+#   (8) a garbage history file -> valid JSON, exit 0, INSUFFICIENT_DATA
+#   (9) two runs on identical inputs produce identical documents apart
+#       from generated_at
+#  (10) catalog integrity: every referenced region key exists and every
+#       coordinate is in range in infra/geo/regions.json and
+#       infra/geo/candidates.json
+#  (11) a lone candidate has a null margin and cannot fire the ADD gate
+#  (12) a large accumulated history still yields a real window (ARG_MAX)
+#  (13) relay necessity and prune candidates are reported per relay
+#  (14) ADD requires stability_runs and add_min_window_sessions, not a margin alone
+#  (15) measured quality (saved-app mean, negative-saving share, route
+#       jitter/loss) is surfaced per relay and in a fleet measured block
+#  (16) a dominant measured negative-saving share blocks ADD; a positive
+#       network leaves ADD eligible
+#  (17) per-source saved-app quality is reported per relay and coarse
+#       source region, with the k floor withholding thin cells and the
+#       sample count plus meets_min_samples flag on every reported row
+#  (18) retention is weighted by cell session volume, so a thin cell cannot
+#       set a relay's figure on its own
+#  (19) a near-but-distinct candidate survives on redundancy while an exact
+#       duplicate is rejected as near_duplicate
+#  (20) flat coverage with high redundancy in a served region -> ADD_REDUNDANT
+#  (21) a thin window cannot fire ADD_REDUNDANT
+#  (22) a dominant measured negative-saving share blocks ADD_REDUNDANT
+#  (23) the measured gate is calibrated to the pair-weighted sample count:
+#       a lone inflated report cannot block ADD, a decisive count does
+#  (24) the per-source display floor is pair-weighted and distinct from the
+#       advisory min_measured_samples flag
+#
+# Tests (3)-(7) use a synthetic three-region catalog under $TMP with
+# fully controlled geometry; tests (1), (2), (8), (9), (10) exercise
+# the real infra/geo catalogs and the real signed registry.
+#
+# Usage: bash infra/scripts/test_recommend_regions.sh
+# Exits 0 and prints "recommend-regions: all assertions passed" on success.
+# Requires: bash, jq.
+# ──────────────────────────────────────────────────────────────
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RECOMMEND="$SCRIPT_DIR/recommend-regions.sh"
+GEO_REAL="$(cd "$SCRIPT_DIR/../geo" && pwd)"
+REGISTRY_REAL="$(cd "$SCRIPT_DIR/../.." && pwd)/web/registry.json"
+
+PASS=0
+FAILURES=0
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+assert_jq() {
+	# assert_jq <file> <jq-expr> <message>
+	local file="$1" expr="$2" msg="$3"
+	if jq -e "$expr" "$file" >/dev/null 2>&1; then
+		PASS=$((PASS + 1))
+	else
+		printf '  FAIL: %s\n        expr: %s\n' "$msg" "$expr" >&2
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+assert_rc0() {
+	# assert_rc0 <rc> <message>
+	if [ "$1" -eq 0 ]; then
+		PASS=$((PASS + 1))
+	else
+		printf '  FAIL: %s (exit %s, expected 0)\n' "$2" "$1" >&2
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+assert_ok() {
+	# assert_ok <message> <cmd...>
+	local msg="$1"
+	shift
+	if "$@" >/dev/null 2>&1; then
+		PASS=$((PASS + 1))
+	else
+		printf '  FAIL: %s\n' "$msg" >&2
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+assert_same() {
+	# assert_same <file-a> <file-b> <message>
+	if diff -q "$1" "$2" >/dev/null 2>&1; then
+		PASS=$((PASS + 1))
+	else
+		printf '  FAIL: %s\n' "$3" >&2
+		diff "$1" "$2" | head -20 >&2
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+if [ ! -f "$RECOMMEND" ]; then
+	printf 'recommend-regions: FAIL - implementation not found: %s\n' "$RECOMMEND" >&2
+	exit 1
+fi
+
+# ── Fixture writers ──────────────────────────────────────────
+# snap <t> <node_id> <reset:true|false> <geo-json>
+snap() {
+	jq -cn --argjson t "$1" --arg id "$2" --argjson reset "$3" --argjson geo "$4" \
+		'{t:$t, relay_count:1, healthy_count:1,
+          per_relay:{($id):{reachable:true,version:"test",active_sessions:0,geo:$geo,reset:$reset}}}'
+}
+
+# write_history <out> <snapshots-json-array>
+write_history() {
+	jq -cn --argjson snaps "$2" '{version:1, generated_at:0, snapshots:$snaps}' >"$1"
+}
+
+# write_registry <out> <nodes-json-array>
+write_registry() {
+	jq -cn --argjson nodes "$2" \
+		'{registry: ({schema_version:1, nodes:$nodes} | tojson), signature:"test"}' >"$1"
+}
+
+# write_previous <out> <top-id> <n-runs>
+write_previous() {
+	jq -cn --arg top "$2" --argjson n "$3" \
+		'{schema_version:1,
+          stability:{top_id:$top, streak:$n, required:3,
+                     runs:[range(0;$n) | {t:(900 + (. * 20)), top_id:$top, score:25, margin:25000}]}}' >"$1"
+}
+
+# write_quality_history <out> <hub-snap1-delta> <hub-snap2-delta> <far-snap1-delta> <far-snap2-delta>
+# Two snapshots over relay-hub-a and relay-far. Each relay carries a per-snapshot
+# delta object so measured-quality fixtures can seed saved-app and route counters
+# while the hub retains enough east-east sessions to clear the ADD floor.
+write_quality_history() {
+	local out="$1" h1="$2" h2="$3" f1="$4" f2="$5"
+	jq -cn --argjson h1 "$h1" --argjson h2 "$h2" --argjson f1 "$f1" --argjson f2 "$f2" '
+      {version:1, generated_at:0, snapshots:[
+        {t:1000, relay_count:2, healthy_count:2, per_relay:{
+          "relay-hub-a":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":100},reset:false,delta:$h1},
+          "relay-far":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":10},reset:false,delta:$f1}}},
+        {t:1060, relay_count:2, healthy_count:2, per_relay:{
+          "relay-hub-a":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":160},reset:false,delta:$h2},
+          "relay-far":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":10},reset:false,delta:$f2}}}
+      ]}' >"$out"
+}
+
+# write_source_history <out> <hub-src1> <hub-src2> <far-src1> <far-src2> [hub-reset]
+# Two snapshots carrying cumulative per-source saved-app maps, so the
+# recommender can reconstruct reset-safe window deltas per source region.
+write_source_history() {
+	local out="$1" h1="$2" h2="$3" f1="$4" f2="$5" r="${6:-false}"
+	jq -cn --argjson h1 "$h1" --argjson h2 "$h2" --argjson f1 "$f1" --argjson f2 "$f2" --argjson r "$r" '
+      {version:1, generated_at:0, snapshots:[
+        {t:1000, relay_count:2, healthy_count:2, per_relay:{
+          "relay-hub-a":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":100},reset:false,delta:{},sources:$h1},
+          "relay-far":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":10},reset:false,delta:{},sources:$f1}}},
+        {t:1060, relay_count:2, healthy_count:2, per_relay:{
+          "relay-hub-a":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":160},reset:$r,delta:{},sources:$h2},
+          "relay-far":{reachable:true,version:"test",active_sessions:0,geo:{"east-east":10},reset:false,delta:{},sources:$f2}}}
+      ]}' >"$out"
+}
+
+# write_retention_history <out> <hub-geo-1> <hub-geo-2> <far-geo-1> <far-geo-2>
+# Two snapshots over relay-hub-a and relay-far with caller-chosen cumulative
+# geo maps, so a fixture can pair one large cell with one thin cell and show
+# which of the two drives a relay's reported retention.
+write_retention_history() {
+	local out="$1" h1="$2" h2="$3" f1="$4" f2="$5"
+	jq -cn --argjson h1 "$h1" --argjson h2 "$h2" --argjson f1 "$f1" --argjson f2 "$f2" '
+      {version:1, generated_at:0, snapshots:[
+        {t:1000, relay_count:2, healthy_count:2, per_relay:{
+          "relay-hub-a":{reachable:true,version:"test",active_sessions:0,geo:$h1,reset:false},
+          "relay-far":{reachable:true,version:"test",active_sessions:0,geo:$f1,reset:false}}},
+        {t:1060, relay_count:2, healthy_count:2, per_relay:{
+          "relay-hub-a":{reachable:true,version:"test",active_sessions:0,geo:$h2,reset:false},
+          "relay-far":{reachable:true,version:"test",active_sessions:0,geo:$f2,reset:false}}}
+      ]}' >"$out"
+}
+
+# write_synth_regions <dir>
+write_synth_regions() {
+	mkdir -p "$1"
+	cat >"$1/regions.json" <<'JSON'
+{
+  "schema_version": 1,
+  "regions": {
+    "hub":  {"label": "Hub",  "lat": 0,  "lon": 0},
+    "east": {"label": "East", "lat": 0,  "lon": 60},
+    "west": {"label": "West", "lat": 0,  "lon": -60},
+    "far":  {"label": "Far",  "lat": 60, "lon": 0}
+  },
+  "countries": {"HU": "hub", "EA": "east", "WE": "west", "FA": "far"},
+  "region_aliases": {"hub": "hub", "east": "east", "west": "west", "far": "far"},
+  "relays": {
+    "relay-hub-a": {"lat": 30, "lon": 0},
+    "relay-hub-b": {"lat": 30, "lon": 1},
+    "relay-far":   {"lat": 60, "lon": 30}
+  }
+}
+JSON
+}
+
+# write_redundancy_regions <dir>
+# Two regions for the redundancy fixtures: eu is already served by one relay
+# at the eu centroid, and far sits 100 degrees east so every candidate shares
+# one long two-leg path. A candidate offset north of the relay stays within
+# redundancy_band while earning no coverage, because the offset makes its path
+# slightly worse.
+write_redundancy_regions() {
+	mkdir -p "$1"
+	cat >"$1/regions.json" <<'JSON'
+{
+  "schema_version": 1,
+  "regions": {
+    "eu":  {"label": "Europe", "lat": 0, "lon": 0},
+    "far": {"label": "Far",    "lat": 0, "lon": 100}
+  },
+  "countries": {"EU": "eu", "FA": "far"},
+  "region_aliases": {"eu": "eu", "far": "far"},
+  "relays": {"relay-fra": {"lat": 0, "lon": 0}}
+}
+JSON
+}
+
+# write_synth_candidates <dir> <candidates-json-array>
+write_synth_candidates() {
+	jq -cn --argjson cands "$2" \
+		'{schema_version:1,
+          params:{alpha:2, window_secs:604800, min_window_sessions:20,
+                  min_cell_sessions:3, stability_runs:3, add_margin:0.10,
+                  move_margin:0.20, redundancy_weight:0.5, move_coverage_keep:0.9,
+                  proximity_ms_floor:15, near_duplicate_ms:25},
+          candidates:$cands}' >"$1/candidates.json"
+}
+
+# run_rec <history> <previous> <registry> <geo-dir> <out> [extra args...]
+run_rec() {
+	local h="$1" p="$2" r="$3" g="$4" o="$5"
+	shift 5
+	bash "$RECOMMEND" --history "$h" --previous "$p" --registry "$r" --geo-dir "$g" --out "$o" "$@" \
+		>/dev/null 2>&1
+}
+
+SYNTH_NODES='[{"node_id":"relay-hub-a","region":"hub","data_addr":"10.0.0.1:4434"},
+              {"node_id":"relay-hub-b","region":"hub","data_addr":"10.0.0.2:4434"},
+              {"node_id":"relay-far","region":"far","data_addr":"10.0.0.3:4434"}]'
+CAND_EAST='{"id":"cand-east","provider":"test","region":"east","lat":0,"lon":60,"free_tier":true,"viable":true,"note":""}'
+CAND_WEST='{"id":"cand-west","provider":"test","region":"west","lat":0,"lon":-60,"free_tier":true,"viable":true,"note":""}'
+CAND_RIVAL='{"id":"cand-rival","provider":"test","region":"west","lat":0,"lon":63.063861606035466,"free_tier":true,"viable":true,"note":""}'
+CAND_HUB='{"id":"cand-hub","provider":"test","region":"hub","lat":0,"lon":20,"free_tier":true,"viable":true,"note":""}'
+CAND_NEAR='{"id":"cand-near","provider":"test","region":"hub","lat":30,"lon":0.2,"free_tier":true,"viable":true,"note":""}'
+
+REG_SYNTH="$TMP/registry-synth.json"
+write_registry "$REG_SYNTH" "$SYNTH_NODES"
+
+# geo-add40: cand-east dominates cell east->east (cand-west gains nothing)
+GEO_ADD="$TMP/geo-add40"
+write_synth_regions "$GEO_ADD"
+write_synth_candidates "$GEO_ADD" "[$CAND_EAST,$CAND_WEST]"
+
+# geo-leader5: cand-east leads cand-east2 by ~5% on cell east->east
+GEO_LEAD="$TMP/geo-leader5"
+write_synth_regions "$GEO_LEAD"
+write_synth_candidates "$GEO_LEAD" "[$CAND_EAST,$CAND_RIVAL]"
+
+# geo-move: cand-hub improves the served hub->hub cell; cand-near is a
+# near-duplicate of relay-hub-a and must be rejected
+GEO_MOVE="$TMP/geo-move"
+write_synth_regions "$GEO_MOVE"
+write_synth_candidates "$GEO_MOVE" "[$CAND_HUB,$CAND_WEST,$CAND_NEAR]"
+
+# geo-single: exactly one candidate survives, so no meaningful margin exists
+GEO_SINGLE="$TMP/geo-single"
+write_synth_regions "$GEO_SINGLE"
+write_synth_candidates "$GEO_SINGLE" "[$CAND_EAST]"
+
+# geo-redundancy: eu is served by relay-fra; eu-london is a distinct second
+# path within redundancy_band, and eu-frankfurt-dup is an exact copy of the
+# relay. Both candidates sit in the already-served eu region.
+CAND_LON='{"id":"eu-london","provider":"test","region":"eu","lat":7.2,"lon":0,"free_tier":true,"viable":true,"note":""}'
+CAND_FRA_DUP='{"id":"eu-frankfurt-dup","provider":"test","region":"eu","lat":0,"lon":0,"free_tier":true,"viable":true,"note":""}'
+REG_RED="$TMP/registry-redundancy.json"
+write_registry "$REG_RED" '[{"node_id":"relay-fra","region":"eu","data_addr":"10.0.0.1:4434"}]'
+GEO_RED="$TMP/geo-redundancy"
+write_redundancy_regions "$GEO_RED"
+write_synth_candidates "$GEO_RED" "[$CAND_LON,$CAND_FRA_DUP]"
+
+# 60 sessions on the shared eu->far path, enough to clear add_min_window_sessions
+H_RED="$TMP/hist-redundancy.json"
+write_history "$H_RED" \
+	"[$(snap 1000 relay-fra false '{"eu-far":100}'),$(snap 1060 relay-fra false '{"eu-far":160}')]"
+# 25 sessions: OK, stable, redundancy above the gain floor, but under the ADD floor
+H_RED_THIN="$TMP/hist-redundancy-thin.json"
+write_history "$H_RED_THIN" \
+	"[$(snap 1000 relay-fra false '{"eu-far":100}'),$(snap 1060 relay-fra false '{"eu-far":125}')]"
+
+# 25 reconstructed sessions in one kept cell
+H_SYNTH="$TMP/hist-synth.json"
+write_history "$H_SYNTH" \
+	"[$(snap 1000 relay-hub-a false '{"east-east":25}'),$(snap 1060 relay-hub-a false '{"east-east":50}')]"
+# 60 reconstructed sessions, enough to clear add_min_window_sessions
+H_SYNTH_BIG="$TMP/hist-synth-big.json"
+write_history "$H_SYNTH_BIG" \
+	"[$(snap 1000 relay-hub-a false '{"east-east":100}'),$(snap 1060 relay-hub-a false '{"east-east":160}')]"
+# same, but for the hub->hub demand used by the MOVE fixtures
+H_MOVE="$TMP/hist-move.json"
+write_history "$H_MOVE" \
+	"[$(snap 1000 relay-hub-a false '{"hub-hub":25}'),$(snap 1060 relay-hub-a false '{"hub-hub":50}')]"
+
+# ── (1) empty/missing history -> INSUFFICIENT_DATA, exit 0 ───
+OUT1="$TMP/out1.json"
+run_rec "$TMP/does-not-exist.json" missing "$REGISTRY_REAL" "$GEO_REAL" "$OUT1"
+assert_rc0 $? "(1) missing history exits 0"
+assert_jq "$OUT1" 'type == "object"' "(1) missing history emits a JSON object"
+assert_jq "$OUT1" '.status == "INSUFFICIENT_DATA"' "(1) missing history is INSUFFICIENT_DATA"
+assert_jq "$OUT1" '.recommendation.action == "NONE" and .matrix == []' "(1) missing history recommends NONE with an empty matrix"
+assert_jq "$OUT1" 'has("schema_version") and has("generated_at") and has("status") and has("window") and has("matrix") and has("existing") and has("ranking") and has("rejected") and has("recommendation") and has("stability") and has("notes")' "(1) full output schema present"
+assert_jq "$OUT1" '.source_quality | has("relays") and has("min_samples") and has("suppressed_cells") and has("min_measured_samples")' "(1) source_quality block is present even with no data"
+
+: >"$TMP/empty.json"
+run_rec "$TMP/empty.json" missing "$REGISTRY_REAL" "$GEO_REAL" "$TMP/out1b.json"
+assert_rc0 $? "(1) empty history file exits 0"
+assert_jq "$TMP/out1b.json" '.status == "INSUFFICIENT_DATA"' "(1) empty history is INSUFFICIENT_DATA"
+
+# ── (2) 25 sessions in one kept cell -> OK + ranking ─────────
+H_REAL="$TMP/hist-real.json"
+write_history "$H_REAL" \
+	"[$(snap 1000 relay-fra false '{"na-eu":25}'),$(snap 1060 relay-fra false '{"na-eu":50}')]"
+OUT2="$TMP/out2.json"
+run_rec "$H_REAL" missing "$REGISTRY_REAL" "$GEO_REAL" "$OUT2"
+assert_rc0 $? "(2) real-catalog run exits 0"
+assert_jq "$OUT2" '.status == "OK"' "(2) 25 sessions is OK"
+assert_jq "$OUT2" '.window.sessions == 25 and .window.snapshots == 2' "(2) window reports the reconstructed total"
+assert_jq "$OUT2" '.window.from_t == 1000 and .window.to_t == 1060' "(2) window boundaries"
+assert_jq "$OUT2" '.matrix == [{"src":"na","dst":"eu","sessions":25}]' "(2) matrix holds the single kept cell"
+assert_jq "$OUT2" '(.ranking | length) > 0' "(2) ranking is non-empty"
+assert_jq "$OUT2" '((.existing | length) >= 1) and (.existing[0] | (has("node_id") and has("region") and has("lat") and has("lon")))' "(2) existing relays are located"
+assert_jq "$OUT2" '[.ranking[] | has("candidate_id") and has("region") and has("score") and has("coverage_gain") and has("redundancy_gain") and has("margin")] | all' "(2) ranking entries carry the full schema"
+# The real EU catalog must offer redundancy away from Frankfurt. The live
+# registry already serves eu from relay-fra, and every Western EU city sits
+# inside the 25 ms near_duplicate_ms floor of Frankfurt, so those candidates
+# are correctly rejected there. Rank the same real catalog against a registry
+# with no EU relay to prove the catalog itself carries a second EU placement.
+REG_NO_EU="$TMP/registry-no-eu.json"
+write_registry "$REG_NO_EU" \
+	'[{"node_id":"relay-lax-1","region":"us-west","data_addr":"10.0.0.1:4434"},
+      {"node_id":"relay-sgp-1","region":"ap-southeast","data_addr":"10.0.0.2:4434"}]'
+OUT2EU="$TMP/out2-eu.json"
+run_rec "$H_REAL" missing "$REG_NO_EU" "$GEO_REAL" "$OUT2EU"
+assert_rc0 $? "(2) real-catalog EU-redundancy run exits 0"
+assert_jq "$OUT2EU" '[.ranking[] | select(.region == "eu") | .candidate_id] | length > 0' "(2) real catalog ranks at least one eu candidate"
+assert_jq "$OUT2EU" '[.ranking[] | select(.region == "eu") | .candidate_id | select(test("lon1|ams1|par1"))] | length > 0' "(2) a non-Frankfurt EU candidate appears in the ranking"
+
+# --window-secs override: a 30s window keeps only the last snapshot
+run_rec "$H_REAL" missing "$REGISTRY_REAL" "$GEO_REAL" "$TMP/out2b.json" --window-secs 30
+assert_rc0 $? "(2) --window-secs run exits 0"
+assert_jq "$TMP/out2b.json" '.status == "INSUFFICIENT_DATA" and .window.snapshots == 1' "(2) --window-secs narrows the window"
+
+# ── (3) a 40% leader without stability -> NONE ───────────────
+OUT3="$TMP/out3.json"
+run_rec "$H_SYNTH_BIG" missing "$REG_SYNTH" "$GEO_ADD" "$OUT3"
+assert_rc0 $? "(3) add40 run exits 0"
+assert_jq "$OUT3" '.status == "OK"' "(3) add40 is OK"
+assert_jq "$OUT3" '.ranking[0].candidate_id == "cand-east"' "(3) cand-east leads"
+assert_jq "$OUT3" '.ranking[0].margin >= 0.40' "(3) leader margin is at least 40%"
+assert_jq "$OUT3" '.ranking[0].margin <= 1' "(3) margin is capped at 1 even when rivals score zero"
+assert_jq "$OUT3" '.recommendation.action == "NONE"' "(3) a single-run margin lead never ADDs"
+assert_jq "$OUT3" '.recommendation.remove_node_id == null' "(3) NONE removes nothing"
+assert_jq "$OUT3" '.stability.streak == 1' "(3) first run has a one-run streak"
+
+# ── (4) a 5% leader with no history -> NONE ──────────────────
+OUT4="$TMP/out4.json"
+run_rec "$H_SYNTH" missing "$REG_SYNTH" "$GEO_LEAD" "$OUT4"
+assert_rc0 $? "(4) leader5 run exits 0"
+assert_jq "$OUT4" '.status == "OK"' "(4) leader5 is OK"
+assert_jq "$OUT4" '.ranking[0].candidate_id == "cand-east"' "(4) cand-east leads"
+assert_jq "$OUT4" '.ranking[0].margin > 0.04 and .ranking[0].margin < 0.06' "(4) leader margin is about 5%"
+assert_jq "$OUT4" '.recommendation.action == "NONE"' "(4) a 5% leader is below add_margin and has no streak"
+assert_jq "$OUT4" '.stability.streak == 1' "(4) no prior runs means a one-run streak"
+
+# ── (5) three prior identical runs -> ADD via stability ──────
+PREV5="$TMP/prev5.json"
+write_previous "$PREV5" cand-east 3
+OUT5="$TMP/out5.json"
+run_rec "$H_SYNTH_BIG" "$PREV5" "$REG_SYNTH" "$GEO_LEAD" "$OUT5"
+assert_rc0 $? "(5) stable-leader run exits 0"
+assert_jq "$OUT5" '.recommendation.action == "ADD" and .recommendation.candidate_id == "cand-east"' "(5) a 5% leader with 3 stable runs recommends ADD"
+assert_jq "$OUT5" '.stability.streak >= 3' "(5) streak reaches stability_runs"
+assert_jq "$OUT5" '(.stability.runs | length) == 4' "(5) this run is appended to the prior three"
+
+# ── (6) MOVE requires stability_runs consecutive runs ────────
+PREV6A="$TMP/prev6a.json"
+write_previous "$PREV6A" cand-hub 1
+OUT6A="$TMP/out6a.json"
+run_rec "$H_MOVE" "$PREV6A" "$REG_SYNTH" "$GEO_MOVE" "$OUT6A"
+assert_rc0 $? "(6) two-run move candidate exits 0"
+assert_jq "$OUT6A" '.status == "OK"' "(6) move fixture is OK"
+assert_jq "$OUT6A" '.ranking[0].candidate_id == "cand-hub"' "(6) cand-hub leads the served hub region"
+assert_jq "$OUT6A" '.rejected == [{"candidate_id":"cand-near","reason":"near_duplicate"}]' "(6) near-duplicate candidate is rejected"
+assert_jq "$OUT6A" '.stability.streak == 2' "(6) two consecutive runs so far"
+assert_jq "$OUT6A" '.recommendation.action == "NONE"' "(6) MOVE needs three consecutive runs"
+
+PREV6B="$TMP/prev6b.json"
+write_previous "$PREV6B" cand-hub 2
+OUT6B="$TMP/out6b.json"
+run_rec "$H_MOVE" "$PREV6B" "$REG_SYNTH" "$GEO_MOVE" "$OUT6B"
+assert_rc0 $? "(6) three-run move candidate exits 0"
+assert_jq "$OUT6B" '.stability.streak == 3' "(6) three consecutive runs"
+assert_jq "$OUT6B" '.recommendation.action == "MOVE"' "(6) a stable high-margin leader over a served region recommends MOVE"
+assert_jq "$OUT6B" '.recommendation.candidate_id == "cand-hub"' "(6) MOVE names the candidate"
+assert_jq "$OUT6B" '.recommendation.remove_node_id == "relay-far"' "(6) MOVE names the relay whose removal retains every kept cell"
+assert_jq "$OUT6B" '.ranking[0].margin >= 0.20' "(6) MOVE margin clears move_margin"
+
+# ── (7) reset reconstruction uses current as the delta ───────
+H_RESET="$TMP/hist-reset.json"
+write_history "$H_RESET" \
+	"[$(snap 1000 relay-hub-a false '{"east-east":5}'),$(snap 1060 relay-hub-a true '{"east-east":25}')]"
+OUT7="$TMP/out7.json"
+run_rec "$H_RESET" missing "$REG_SYNTH" "$GEO_ADD" "$OUT7"
+assert_rc0 $? "(7) reset run exits 0"
+assert_jq "$OUT7" '.status == "OK" and .window.sessions == 25' "(7) reset=true treats current as the delta"
+
+H_NORESET="$TMP/hist-noreset.json"
+write_history "$H_NORESET" \
+	"[$(snap 1000 relay-hub-a false '{"east-east":5}'),$(snap 1060 relay-hub-a false '{"east-east":25}')]"
+OUT7B="$TMP/out7b.json"
+run_rec "$H_NORESET" missing "$REG_SYNTH" "$GEO_ADD" "$OUT7B"
+assert_jq "$OUT7B" '.status == "OK" and .window.sessions == 20' "(7) reset=false subtracts the previous cumulative count"
+
+# ── (8) garbage history -> valid JSON, exit 0, INSUFFICIENT ──
+printf 'not json at all {{{' >"$TMP/garbage.json"
+OUT8="$TMP/out8.json"
+run_rec "$TMP/garbage.json" missing "$REGISTRY_REAL" "$GEO_REAL" "$OUT8"
+assert_rc0 $? "(8) garbage history exits 0"
+assert_jq "$OUT8" 'type == "object"' "(8) garbage history emits a JSON object"
+assert_jq "$OUT8" '.status == "INSUFFICIENT_DATA" and .recommendation.action == "NONE"' "(8) garbage history is INSUFFICIENT_DATA"
+
+# ── (9) determinism ──────────────────────────────────────────
+run_rec "$H_SYNTH" "$PREV5" "$REG_SYNTH" "$GEO_LEAD" "$TMP/det-a.json"
+run_rec "$H_SYNTH" "$PREV5" "$REG_SYNTH" "$GEO_LEAD" "$TMP/det-b.json"
+jq -S 'del(.generated_at)' "$TMP/det-a.json" >"$TMP/det-a.norm.json"
+jq -S 'del(.generated_at)' "$TMP/det-b.json" >"$TMP/det-b.norm.json"
+assert_same "$TMP/det-a.norm.json" "$TMP/det-b.norm.json" "(9) identical inputs produce identical output"
+
+# ── (10) catalog integrity ───────────────────────────────────
+assert_ok "(10) regions.json: country/alias region keys exist and coordinates are in range" \
+	jq -e '
+      (.regions | keys) as $R
+      | ((.countries // {}) | to_entries | map(.value | IN($R[])) | all)
+      and ((.region_aliases // {}) | to_entries | map(.value | IN($R[])) | all)
+      and ([.regions[] | ((.lat | type) == "number") and ((.lon | type) == "number")
+                        and (.lat >= -90) and (.lat <= 90)
+                        and (.lon >= -180) and (.lon <= 180)] | all)
+      and ([.relays | to_entries[] | .value
+            | ((.lat | type) == "number") and ((.lon | type) == "number")
+              and (.lat >= -90) and (.lat <= 90)
+              and (.lon >= -180) and (.lon <= 180)] | all)
+    ' "$GEO_REAL/regions.json"
+
+assert_ok "(10) candidates.json: candidate region keys exist and coordinates are in range" \
+	jq -e --slurpfile reg "$GEO_REAL/regions.json" '
+      ($reg[0].regions | keys) as $R
+      | ([.candidates[] | .region | IN($R[])] | all)
+      and ([.candidates[] | ((.lat | type) == "number") and ((.lon | type) == "number")
+                           and (.lat >= -90) and (.lat <= 90)
+                           and (.lon >= -180) and (.lon <= 180)] | all)
+      and (([.candidates[].id] | length) == ([.candidates[].id] | unique | length))
+      and ([.candidates[] | (.free_tier | type) == "boolean"] | all)
+    ' "$GEO_REAL/candidates.json"
+
+# ── (11) single candidate: margin is null, no fabricated ADD ─
+OUT11="$TMP/out11.json"
+run_rec "$H_SYNTH" missing "$REG_SYNTH" "$GEO_SINGLE" "$OUT11"
+assert_rc0 $? "(11) single-candidate run exits 0"
+assert_jq "$OUT11" '.ranking | length == 1' "(11) exactly one candidate is ranked"
+assert_jq "$OUT11" '.ranking[0].margin == null' "(11) a lone candidate has no margin, not a fabricated one"
+assert_jq "$OUT11" '.recommendation.action == "NONE"' "(11) a lone candidate cannot fire the margin gate"
+
+# ── (12) a large accumulated history does not fall back ──────
+# Regression: the recommender passed the whole history through --argjson, so a
+# real accumulated history blew past ARG_MAX and silently emitted the
+# INSUFFICIENT_DATA document (window snapshots 0) while small fixtures passed.
+LARGE="$TMP/large-history.json"
+jq -cn '{version:1,generated_at:0,snapshots:[range(0;60) | {t:(1700000000 + .*3600),relay_count:2,healthy_count:2,interval:{sessions_created:5},totals:{sessions_created:5},per_relay:{"relay-a":{reachable:true,reset:false,geo:{"na-eu":5}},"relay-b":{reachable:true,reset:false,geo:{"eu-eu":4}}}}]}' >"$LARGE"
+OUT12="$TMP/out12.json"
+run_rec "$LARGE" missing "$REGISTRY_REAL" "$GEO_REAL" "$OUT12"
+assert_rc0 $? "(12) large history exits 0"
+assert_jq "$OUT12" '.notes | test("fatal parse failure") | not' "(12) large history does not fall back to the minimal document"
+assert_jq "$OUT12" '.window.snapshots > 0' "(12) large history yields a non-empty window"
+
+# ── (13) relay necessity is reported for every existing relay ─
+assert_jq "$OUT3" '.relay_necessity | length > 0' "(13) necessity lists existing relays"
+assert_jq "$OUT3" '(.relay_necessity | length) == (.existing | length)' "(13) one necessity row per existing relay"
+assert_jq "$OUT3" '.relay_necessity | all(has("sessions") and has("worst_retention"))' "(13) necessity rows carry sessions and retention"
+assert_jq "$OUT3" '.prune_candidates | type == "array"' "(13) prune_candidates is an array"
+
+# ── (14) a stable leader below the session floor is NONE ─────
+PREV14="$TMP/prev14.json"
+write_previous "$PREV14" cand-east 3
+OUT14="$TMP/out14.json"
+run_rec "$H_SYNTH" "$PREV14" "$REG_SYNTH" "$GEO_LEAD" "$OUT14"
+assert_rc0 $? "(14) small-window stable run exits 0"
+assert_jq "$OUT14" '.status == "OK"' "(14) small window is still OK"
+assert_jq "$OUT14" '.window.sessions == 25' "(14) window is below the ADD floor"
+assert_jq "$OUT14" '.stability.streak >= 3' "(14) the leader is stable"
+assert_jq "$OUT14" '.recommendation.action == "NONE"' "(14) stability alone does not ADD below add_min_window_sessions"
+
+# ── (15) measured saved-app/jitter/loss is surfaced ──────────
+# relay-hub-a's two snapshot deltas sum to a 10 ms saved-app mean and a
+# 40% negative-saving share; relay-far reports none. Both the per-relay
+# necessity rows and the fleet measured block must carry it.
+H_QUAL="$TMP/hist-quality.json"
+write_quality_history "$H_QUAL" \
+	'{"saved_app_ms_sum":60,"saved_app_ms_count":6,"saved_app_ms_negative_count":1,"route_jitter_ms_sum":60,"route_jitter_ms_count":6,"route_lost":3,"route_recovered":2}' \
+	'{"saved_app_ms_sum":40,"saved_app_ms_count":4,"saved_app_ms_negative_count":3,"route_jitter_ms_sum":40,"route_jitter_ms_count":4,"route_lost":2,"route_recovered":1}' \
+	'{}' '{}'
+OUT15="$TMP/out15.json"
+run_rec "$H_QUAL" missing "$REG_SYNTH" "$GEO_ADD" "$OUT15"
+assert_rc0 $? "(15) measured-quality run exits 0"
+assert_jq "$OUT15" '.relay_necessity[] | select(.node_id == "relay-hub-a") | .saved_app_samples == 10' "(15) hub measured sample count"
+assert_jq "$OUT15" '.relay_necessity[] | select(.node_id == "relay-hub-a") | .saved_app_mean_ms == 10' "(15) hub measured saved-app mean"
+assert_jq "$OUT15" '.relay_necessity[] | select(.node_id == "relay-hub-a") | .saved_app_negative_share == 0.4' "(15) hub negative-saving share"
+assert_jq "$OUT15" '.relay_necessity[] | select(.node_id == "relay-far") | .saved_app_samples == 0 and .saved_app_mean_ms == null' "(15) unmeasured relay reports zero samples and a null mean"
+assert_jq "$OUT15" '.measured.saved_app_samples == 10 and .measured.saved_app_mean_ms == 10' "(15) fleet measured samples/mean"
+assert_jq "$OUT15" '.measured.saved_app_negative_share == 0.4' "(15) fleet negative-saving share"
+assert_jq "$OUT15" '.measured.route_jitter_mean_ms == 10' "(15) fleet route jitter mean"
+assert_jq "$OUT15" '.measured.route_loss_ratio == 0.625' "(15) fleet route loss ratio"
+
+# ── (16) the measured negative-saving gate blocks ADD ────────
+# Same unserved east leader and stability as (5), but the hub's window
+# shows a 70% negative-saving share over 20 pair-weighted samples: ADD is
+# suppressed. A 20% share over the same count leaves the ADD eligible.
+H_QUAL_BAD="$TMP/hist-quality-bad.json"
+write_quality_history "$H_QUAL_BAD" \
+	'{"saved_app_ms_sum":30,"saved_app_ms_count":20,"saved_app_ms_negative_count":14}' \
+	'{}' '{}' '{}'
+H_QUAL_GOOD="$TMP/hist-quality-good.json"
+write_quality_history "$H_QUAL_GOOD" \
+	'{"saved_app_ms_sum":30,"saved_app_ms_count":20,"saved_app_ms_negative_count":4}' \
+	'{}' '{}' '{}'
+PREV16="$TMP/prev16.json"
+write_previous "$PREV16" cand-east 3
+OUT16B="$TMP/out16-bad.json"
+run_rec "$H_QUAL_BAD" "$PREV16" "$REG_SYNTH" "$GEO_LEAD" "$OUT16B"
+assert_rc0 $? "(16) negative-saving run exits 0"
+assert_jq "$OUT16B" '.measured.saved_app_negative_share == 0.7' "(16) negative share is measured"
+assert_jq "$OUT16B" '.window.sessions >= 50 and .stability.streak >= 3' "(16) the leader would otherwise ADD"
+assert_jq "$OUT16B" '.recommendation.action == "NONE"' "(16) a dominant negative-saving share blocks ADD"
+OUT16G="$TMP/out16-good.json"
+run_rec "$H_QUAL_GOOD" "$PREV16" "$REG_SYNTH" "$GEO_LEAD" "$OUT16G"
+assert_rc0 $? "(16) positive-saving run exits 0"
+assert_jq "$OUT16G" '.recommendation.action == "ADD" and .recommendation.candidate_id == "cand-east"' "(16) a positive-saving network leaves ADD eligible"
+
+# ── (17) per-source measured quality is reported per relay ───
+# relay-hub-a's eu delta is 24 pair-weighted samples / 240 ms / 4 negative, so
+# 10 ms mean and a 1/6 negative share, and it clears min_measured_samples. Its
+# apac delta is 2 samples, below the k=3 floor, so the cell is withheld and
+# counted. relay-far reports nothing, so its source list stays empty.
+H_SOURCE="$TMP/hist-source.json"
+write_source_history "$H_SOURCE" \
+	'{"eu":{"saved_app_ms_sum":40,"saved_app_ms_count":4,"saved_app_ms_negative_count":0}}' \
+	'{"eu":{"saved_app_ms_sum":280,"saved_app_ms_count":28,"saved_app_ms_negative_count":4},"apac":{"saved_app_ms_sum":10,"saved_app_ms_count":2,"saved_app_ms_negative_count":1}}' \
+	'{}' '{}'
+OUT17="$TMP/out17.json"
+run_rec "$H_SOURCE" missing "$REG_SYNTH" "$GEO_ADD" "$OUT17"
+assert_rc0 $? "(17) per-source run exits 0"
+assert_jq "$OUT17" '.source_quality.min_samples == 3' "(17) k floor is 3"
+assert_jq "$OUT17" '.source_quality.suppressed_cells == 1' "(17) below-floor cell is counted, not shown"
+assert_jq "$OUT17" '(.source_quality.relays | length) == (.existing | length)' "(17) one row per existing relay"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources | length == 1' "(17) hub reports one cleared source"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].src_region == "eu"' "(17) cleared source is eu"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].saved_app_samples == 24' "(17) row carries the sample count"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].saved_app_mean_ms == 10' "(17) row carries the measured mean"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].saved_app_negative_share == 0.166667' "(17) row carries the negative share"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].meets_min_samples == true' "(17) 24 samples clear min_measured_samples"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources_suppressed == 1' "(17) hub withheld-cell count"
+assert_jq "$OUT17" '[.source_quality.relays[] | select(.node_id == "relay-far")][0].sources == []' "(17) unmeasured relay has an empty source list"
+assert_jq "$OUT17" '([.source_quality.relays[].sources[] | select(.src_region == "apac")] | length) == 0' "(17) withheld source never appears"
+
+# A relay reset treats the current cumulative as the interval delta, so a
+# falling per-source counter cannot produce a zero or negative window.
+H_SOURCE_RESET="$TMP/hist-source-reset.json"
+write_source_history "$H_SOURCE_RESET" \
+	'{"eu":{"saved_app_ms_sum":100,"saved_app_ms_count":10,"saved_app_ms_negative_count":5}}' \
+	'{"eu":{"saved_app_ms_sum":40,"saved_app_ms_count":4,"saved_app_ms_negative_count":2}}' \
+	'{}' '{}' true
+OUT17R="$TMP/out17-reset.json"
+run_rec "$H_SOURCE_RESET" missing "$REG_SYNTH" "$GEO_ADD" "$OUT17R"
+assert_rc0 $? "(17) reset source run exits 0"
+assert_jq "$OUT17R" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].saved_app_samples == 4' "(17) reset uses current as the delta"
+assert_jq "$OUT17R" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].saved_app_mean_ms == 10' "(17) reset mean recomputed from the current window"
+
+# ── (18) retention is weighted by cell session volume ────────
+# The live defect: relay-fra reads a critical-looking 0.23 driven by a thin
+# eu->eu cell (both endpoints collapsed onto one centroid) while the far
+# larger africa->eu cell retains 0.895. These fixtures replay that shape on
+# the synthetic catalog. far-far is the thin intra-region cell where
+# relay-far is the nearest relay, so dropping relay-far roughly halves its
+# retention; hub-east is the large inter-region cell that relay-hub-a already
+# serves, so dropping relay-far leaves it untouched (retention 1). With the
+# large cell carrying the volume, relay-far must read as well retained; flip
+# the volumes and it must still read as critical.
+H_RET_WEIGHTED="$TMP/hist-ret-weighted.json"
+write_retention_history "$H_RET_WEIGHTED" \
+	'{"hub-east":100}' '{"hub-east":260}' '{"far-far":5}' '{"far-far":13}'
+OUT18="$TMP/out18.json"
+run_rec "$H_RET_WEIGHTED" missing "$REG_SYNTH" "$GEO_ADD" "$OUT18"
+assert_rc0 $? "(18) weighted-retention run exits 0"
+assert_jq "$OUT18" '.matrix == [{"src":"far","dst":"far","sessions":8},{"src":"hub","dst":"east","sessions":160}]' "(18) fixture pairs a thin intra-region cell with a large inter-region cell"
+assert_jq "$OUT18" '.relay_necessity[] | select(.node_id == "relay-far") | .worst_retention > 0.9' "(18) the large inter-region cell dominates the thin cell"
+
+H_RET_CRITICAL="$TMP/hist-ret-critical.json"
+write_retention_history "$H_RET_CRITICAL" \
+	'{"hub-east":5}' '{"hub-east":13}' '{"far-far":100}' '{"far-far":260}'
+OUT18C="$TMP/out18c.json"
+run_rec "$H_RET_CRITICAL" missing "$REG_SYNTH" "$GEO_ADD" "$OUT18C"
+assert_rc0 $? "(18) critical-retention run exits 0"
+assert_jq "$OUT18C" '.relay_necessity[] | select(.node_id == "relay-far") | .worst_retention < 0.6' "(18) a large cell that depends on relay-far still drives retention down"
+
+# ── (19) near-but-distinct survives; exact duplicate is rejected
+# relay-fra serves eu at the eu centroid. eu-london is 800 km north of it:
+# within redundancy_band of the shared two-leg path, but far enough to be a
+# distinct second path rather than a clone. The candidate at the relay
+# coordinates earns nothing and sits within distinct_min_ms, so it is the
+# only near_duplicate. This is the London-against-Frankfurt case.
+OUT19="$TMP/out19.json"
+run_rec "$H_RED" missing "$REG_RED" "$GEO_RED" "$OUT19"
+assert_rc0 $? "(19) redundancy fixture exits 0"
+assert_jq "$OUT19" '.status == "OK" and .window.sessions == 60' "(19) redundancy fixture is OK"
+assert_jq "$OUT19" '[.ranking[] | select(.candidate_id == "eu-london")] | length == 1' "(19) near-but-distinct candidate survives"
+assert_jq "$OUT19" '[.ranking[] | select(.candidate_id == "eu-london")][0].redundancy_gain > 0' "(19) survivor earns redundancy"
+assert_jq "$OUT19" '[.ranking[] | select(.candidate_id == "eu-london")][0].coverage_gain == 0' "(19) survivor earns no coverage: flat coverage"
+assert_jq "$OUT19" '.rejected == [{"candidate_id":"eu-frankfurt-dup","reason":"near_duplicate"}]' "(19) exact duplicate is rejected as near_duplicate"
+assert_jq "$OUT19" '.recommendation.action == "NONE"' "(19) no stability yet, so no ADD_REDUNDANT"
+
+# ── (20) flat coverage with high redundancy -> ADD_REDUNDANT ─
+PREV20="$TMP/prev20.json"
+write_previous "$PREV20" eu-london 3
+OUT20="$TMP/out20.json"
+run_rec "$H_RED" "$PREV20" "$REG_RED" "$GEO_RED" "$OUT20"
+assert_rc0 $? "(20) ADD_REDUNDANT run exits 0"
+assert_jq "$OUT20" '.recommendation.action == "ADD_REDUNDANT" and .recommendation.candidate_id == "eu-london"' "(20) a stable redundant leader in a served region ADDs a redundant relay"
+assert_jq "$OUT20" '.recommendation.remove_node_id == null' "(20) ADD_REDUNDANT removes nothing"
+assert_jq "$OUT20" '.ranking[0].coverage_gain == 0 and .ranking[0].redundancy_gain >= 3' "(20) the branch is driven by redundancy, not new coverage"
+assert_jq "$OUT20" '.stability.streak >= 3 and .window.sessions >= 50' "(20) the same stability and window gates as ADD are met"
+
+# ── (21) thin data does not produce ADD_REDUNDANT ────────────
+PREV21="$TMP/prev21.json"
+write_previous "$PREV21" eu-london 3
+OUT21="$TMP/out21.json"
+run_rec "$H_RED_THIN" "$PREV21" "$REG_RED" "$GEO_RED" "$OUT21"
+assert_rc0 $? "(21) thin redundancy run exits 0"
+assert_jq "$OUT21" '.status == "OK" and .window.sessions == 25' "(21) thin redundancy window is OK but below the ADD floor"
+assert_jq "$OUT21" '.stability.streak >= 3' "(21) the redundant leader is stable"
+assert_jq "$OUT21" '.ranking[0].candidate_id == "eu-london" and .ranking[0].redundancy_gain >= 3' "(21) the leader clears the redundancy gain floor"
+assert_jq "$OUT21" '.recommendation.action == "NONE"' "(21) a thin window cannot fire ADD_REDUNDANT"
+
+# ── (22) a negative-saving network blocks ADD_REDUNDANT too ──
+# Same served-region redundant leader as (20), but the relay window carries a
+# 70% negative-saving share over 20 samples, so the measured-quality gate that
+# suppresses an unserved ADD must suppress the redundant ADD as well.
+H_RED_BAD="$TMP/hist-redundancy-bad.json"
+jq -cn '
+  {version:1,generated_at:0,snapshots:[
+    {t:1000,relay_count:1,healthy_count:1,per_relay:{
+      "relay-fra":{reachable:true,version:"test",active_sessions:0,geo:{"eu-far":100},reset:false,
+                   delta:{saved_app_ms_sum:30,saved_app_ms_count:10,saved_app_ms_negative_count:7}}}},
+    {t:1060,relay_count:1,healthy_count:1,per_relay:{
+      "relay-fra":{reachable:true,version:"test",active_sessions:0,geo:{"eu-far":160},reset:false,
+                   delta:{saved_app_ms_sum:30,saved_app_ms_count:10,saved_app_ms_negative_count:7}}}}
+  ]}' >"$H_RED_BAD"
+OUT22="$TMP/out22.json"
+run_rec "$H_RED_BAD" "$PREV20" "$REG_RED" "$GEO_RED" "$OUT22"
+assert_rc0 $? "(22) negative-saving redundancy run exits 0"
+assert_jq "$OUT22" '.measured.saved_app_samples == 20 and .measured.saved_app_negative_share == 0.7' "(22) the fleet negative-saving share is measured"
+assert_jq "$OUT22" '.ranking[0].redundancy_gain >= 3 and .ranking[0].coverage_gain == 0' "(22) the leader would otherwise ADD_REDUNDANT"
+assert_jq "$OUT22" '.recommendation.action == "NONE"' "(22) a dominant negative-saving share blocks ADD_REDUNDANT"
+
+# ── (23) the measured gate is calibrated to the pair-weighted count ─
+# `saved_app_ms_count` is weighted by `saved_app_pairs` (proxy/src/metrics.rs),
+# so one report can contribute several samples. A single client reporting
+# saved_app_pairs=8 with a negative saving yields a count of 8: above the old
+# default floor of 5, so one client alone could suppress a legitimate ADD. The
+# floor is calibrated to 20 so that a lone inflated report stays below it and
+# only a genuinely populated window blocks. A 24-sample window is decisive.
+H_PAIRS_LONE="$TMP/hist-pairs-lone.json"
+write_quality_history "$H_PAIRS_LONE" \
+	'{"saved_app_ms_sum":20,"saved_app_ms_count":8,"saved_app_ms_negative_count":8}' \
+	'{}' '{}' '{}'
+PREV23="$TMP/prev23.json"
+write_previous "$PREV23" cand-east 3
+OUT23="$TMP/out23.json"
+run_rec "$H_PAIRS_LONE" "$PREV23" "$REG_SYNTH" "$GEO_LEAD" "$OUT23"
+assert_rc0 $? "(23) lone inflated report exits 0"
+assert_jq "$OUT23" '.measured.saved_app_samples == 8' "(23) the lone pair-weighted count is measured"
+assert_jq "$OUT23" '.window.sessions >= 50 and .stability.streak >= 3' "(23) the leader would otherwise ADD"
+assert_jq "$OUT23" '.recommendation.action == "ADD" and .recommendation.candidate_id == "cand-east"' "(23) one inflated report is below the calibrated floor and cannot block ADD"
+
+H_PAIRS_DECISIVE="$TMP/hist-pairs-decisive.json"
+write_quality_history "$H_PAIRS_DECISIVE" \
+	'{"saved_app_ms_sum":60,"saved_app_ms_count":24,"saved_app_ms_negative_count":16}' \
+	'{}' '{}' '{}'
+OUT23D="$TMP/out23-decisive.json"
+run_rec "$H_PAIRS_DECISIVE" "$PREV23" "$REG_SYNTH" "$GEO_LEAD" "$OUT23D"
+assert_rc0 $? "(23) decisive pair-weighted run exits 0"
+assert_jq "$OUT23D" '.measured.saved_app_samples == 24' "(23) the decisive count reaches the fleet measured block"
+assert_jq "$OUT23D" '.measured.saved_app_negative_share == 0.666667' "(23) the decisive negative share is measured"
+assert_jq "$OUT23D" '.recommendation.action == "NONE"' "(23) a decisive pair-weighted count blocks ADD"
+
+# ── (24) the per-source display floor is pair-weighted, not a k floor ─
+# A single client reporting saved_app_pairs=3 yields a per-source count of 3,
+# which clears the low display floor and is shown, but it is one client, not
+# three, so meets_min_samples is false. This proves the display floor and the
+# advisory min_measured_samples flag are distinct: the row is visible with its
+# count, and the operator can see it is thin.
+H_SRC_DISPLAY="$TMP/hist-src-display.json"
+write_source_history "$H_SRC_DISPLAY" \
+	'{"eu":{"saved_app_ms_sum":0,"saved_app_ms_count":0,"saved_app_ms_negative_count":0}}' \
+	'{"eu":{"saved_app_ms_sum":30,"saved_app_ms_count":3,"saved_app_ms_negative_count":0}}' \
+	'{}' '{}'
+OUT24="$TMP/out24.json"
+run_rec "$H_SRC_DISPLAY" missing "$REG_SYNTH" "$GEO_ADD" "$OUT24"
+assert_rc0 $? "(24) pair-weighted display-floor run exits 0"
+assert_jq "$OUT24" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources | length == 1' "(24) a count of 3 clears the display floor and is shown"
+assert_jq "$OUT24" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].saved_app_samples == 3' "(24) the shown row carries its pair-weighted count"
+assert_jq "$OUT24" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources[0].meets_min_samples == false' "(24) one client is below min_measured_samples and is flagged, not hidden"
+assert_jq "$OUT24" '[.source_quality.relays[] | select(.node_id == "relay-hub-a")][0].sources_suppressed == 0' "(24) a shown cell is not counted as suppressed"
+
+# ── Verdict ──────────────────────────────────────────────────
+if [ "$FAILURES" -eq 0 ]; then
+	printf 'recommend-regions: all assertions passed\n'
+	printf '  (%s checks)\n' "$PASS"
+	exit 0
+fi
+
+printf 'recommend-regions: %s assertion(s) failed (%s passed)\n' "$FAILURES" "$PASS" >&2
+exit 1

@@ -1,0 +1,24 @@
+# LightSpeed Proxy — single-node or mesh deployment
+#
+# Single node:
+#   docker compose up -d
+#
+# Multi-node mesh (edit PROXY_SERVERS in each node's config):
+#   docker compose up -d --scale proxy=3
+
+services:
+  proxy:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    ports:
+      - "4434:4434/udp"
+      - "8080:8080/tcp"
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3

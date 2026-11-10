@@ -1,0 +1,22 @@
+//! Operational modes for the LightSpeed client.
+//!
+//! Each submodule encapsulates one top-level mode that `main` can dispatch into,
+//! keeping `main.rs` a thin orchestrator.
+
+pub mod capture_mode;
+pub mod control_test;
+pub mod diagnose_mode;
+pub mod keepalive;
+pub mod live_test;
+pub mod proxy_probe;
+pub mod redirect_windivert;
+pub mod reroute;
+pub mod tunnel_test;
+
+pub mod verify_game;
+
+pub mod benchmark_mode;
+pub mod demo_mode;
+pub mod intercept_mode;
+pub mod smoke_test;
+pub mod watch_mode;

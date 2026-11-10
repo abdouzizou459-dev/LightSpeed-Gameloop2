@@ -1,0 +1,134 @@
+//! # LightSpeed GUI - Platform Abstraction
+//!
+//! Traits and helpers that isolate platform-specific concerns (system tray,
+//! font paths, admin detection) behind a generic
+//! [`Platform`] + [`TrayHandle`] interface.  The Windows, Linux, and macOS
+//! backends live in [`windows`], [`linux`], and [`macos`] respectively and are
+//! selected at compile time via `#[cfg]`. The macOS backend is **untested**.
+
+use crate::app::TrayState;
+use eframe::egui;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+/// Shared flag the tray sets when the user picks "Quit"; the frame loop turns
+/// it into a clean process exit.
+pub type QuitFlag = Arc<AtomicBool>;
+
+/// A [`std::process::Command`] for `program` that cannot flash a console window
+/// on Windows.
+///
+/// This GUI owns no console (`windows_subsystem = "windows"`), so spawning a
+/// console binary without `CREATE_NO_WINDOW` makes Windows allocate a NEW
+/// console window for the child. On non-Windows targets this is exactly
+/// `Command::new`.
+pub(crate) fn silent_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Actions returned by [`TrayHandle::poll_events`] that the app must handle
+/// because they need the Engine (owned by the app).
+///
+/// Show-window and Quit actions are handled inside the tray (they only need
+/// the `egui::Context` and the shared [`QuitFlag`) and never appear here.
+#[allow(dead_code)] // Connect/Disconnect only constructed on Windows (real tray)
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrayAction {
+    Connect,
+    Disconnect,
+}
+
+pub trait TrayHandle: Send {
+    fn poll_events(&self, ctx: &egui::Context) -> Vec<TrayAction>;
+
+    /// Update the tray icon colour and tooltip to reflect `state`.
+    ///
+    /// The implementation SHOULD skip redundant updates (same state as last
+    /// call) to avoid unnecessary WM_SETICON traffic on Windows.
+    fn set_state(&self, state: TrayState, rtt_ms: f64);
+}
+
+/// The built-in UDP scan range for a game key, with `default_port` as the
+/// fallback for a key the table does not cover.
+///
+/// The Manual flow shows it as the port-range field's example, so the hint
+/// reads as the game about to be scanned.
+pub fn default_port_range(key: &str, default_port: u16) -> (u16, u16) {
+    match key {
+        "rust" => (28015, 30000),
+        "cs2" | "csgo" | "dota2" => (27015, 27100),
+        "valorant" => (7000, 7500),
+        "apex" => (37000, 37050),
+        "lol" => (5000, 5500),
+        "pubg" => (7777, 7843),
+        "bodycam" => (27000, 27050),
+        "zomboid" => (16261, 16262),
+        "wardogs" => (7777, 7788),
+        "minecraft" => (19132, 19133),
+        "hunt" => (20000, 20099),
+        "arcraiders" => (7600, 7777),
+        _ => (default_port, default_port),
+    }
+}
+
+pub trait Platform {
+    type Tray: TrayHandle;
+
+    /// Build the platform tray, or `None` when it is unavailable.
+    ///
+    /// Returning `None` (instead of panicking) lets the app keep running
+    /// without a tray and makes closing the window exit instead of hiding it.
+    fn new_tray(quit: QuitFlag) -> Option<Self::Tray>;
+    fn is_admin() -> bool;
+    fn is_capture_available() -> bool;
+    fn setup_fonts(ctx: &egui::Context);
+
+    /// Whether this platform has a real, recoverable system tray.
+    ///
+    /// On Windows this reflects whether the icon was actually created (a
+    /// failed tray is not recoverable); Linux and macOS use a stub tray and
+    /// always return `false`, so the close-intercept and "Hide to tray"
+    /// affordance are skipped there (hiding would strand the window).
+    fn has_system_tray() -> bool {
+        false
+    }
+
+    /// Relaunch elevated, or do nothing when already elevated.
+    fn relaunch_as_admin();
+}
+
+// ── Platform selection ──────────────────────────────────────────────────
+// Both modules exist on disk so the IDE can check them, but only one is
+// compiled depending on the target OS.
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+mod platform_impl {
+    pub type CurrentPlatform = super::windows::WindowsPlatform;
+}
+
+#[cfg(target_os = "linux")]
+mod platform_impl {
+    pub type CurrentPlatform = super::linux::LinuxPlatform;
+}
+
+#[cfg(target_os = "macos")]
+mod platform_impl {
+    pub type CurrentPlatform = super::macos::MacosPlatform;
+}
+
+pub use platform_impl::*;

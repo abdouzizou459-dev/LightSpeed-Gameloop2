@@ -1,0 +1,284 @@
+//! Proxy probing and route selection helpers.
+//!
+//! Provides async functions to measure latency to one or more proxy nodes and
+//! select the best one via the configured `RouteSelector` strategy.
+
+use std::net::SocketAddrV4;
+use std::time::Duration;
+
+use tracing::warn;
+
+use crate::cli::parse_proxy_addr;
+use crate::route::selector::{DestinationAwareSelector, NearestSelector};
+use crate::route::{destination, ProxyHealth, ProxyNode, RouteSelector, SelectedRoute};
+
+/// A relay to probe: `(id, data_addr, region)`. The region is the coarse
+/// registry label (for example `ap-southeast-2`); a manually configured relay
+/// with no registry entry uses `"unknown"`.
+pub type ProbeCandidate = (String, String, String);
+
+/// Probe a single proxy by sending keepalive packets and measuring RTT.
+///
+/// Sends `num_pings` keepalive packets and returns the **median** RTT in
+/// microseconds.  Returns `None` if the proxy does not respond within the
+/// timeout.
+pub async fn probe_single_proxy(
+    addr: SocketAddrV4,
+    num_pings: usize,
+    timeout_ms: u64,
+) -> Option<u64> {
+    use lightspeed_protocol::TunnelHeader;
+    use tokio::net::UdpSocket;
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let mut rtts = Vec::with_capacity(num_pings);
+
+    for seq in 0..num_pings as u16 {
+        let send_time = std::time::Instant::now();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u32;
+
+        let header =
+            TunnelHeader::keepalive(seq, ts).with_session_token(crate::session::session_token());
+        let packet = header.encode_to_array();
+
+        if socket.send_to(&packet, addr).await.is_err() {
+            continue;
+        }
+
+        let mut buf = vec![0u8; 128];
+        if let Ok(Ok((len, _))) = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        {
+            if TunnelHeader::decode(&buf[..len]).is_ok() {
+                let rtt = send_time.elapsed().as_micros() as u64;
+                rtts.push(rtt);
+            }
+        }
+
+        // Small delay between pings to avoid burst flooding
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    if rtts.is_empty() {
+        return None;
+    }
+
+    // Return median RTT
+    rtts.sort();
+    Some(rtts[rtts.len() / 2])
+}
+
+/// Probe all configured proxy servers concurrently and return a `ProxyNode`
+/// list with measured latencies. Each node is labeled `proxy-{i}`.
+pub async fn probe_all_proxies(
+    servers: &[String],
+    data_port: u16,
+    quic_port: u16,
+) -> Vec<ProxyNode> {
+    let candidates: Vec<ProbeCandidate> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, server_str)| {
+            (
+                format!("proxy-{}", i),
+                server_str.clone(),
+                "unknown".to_string(),
+            )
+        })
+        .collect();
+    probe_labeled(&candidates, data_port, quic_port).await
+}
+
+/// Probe a labeled list of proxy candidates concurrently and return a
+/// `ProxyNode` list with measured latencies. Each tuple is
+/// `(label, addr_str)`, and the resulting `ProxyNode.id` is the supplied label.
+pub async fn probe_labeled(
+    candidates: &[ProbeCandidate],
+    data_port: u16,
+    quic_port: u16,
+) -> Vec<ProxyNode> {
+    let mut handles = Vec::new();
+
+    for (id, server_str, region) in candidates {
+        let addr = match parse_proxy_addr(server_str) {
+            Ok(a) => {
+                // If the server string has no port component, use the config data_port
+                if !server_str.contains(':') {
+                    SocketAddrV4::new(*a.ip(), data_port)
+                } else {
+                    a
+                }
+            }
+            Err(e) => {
+                warn!("Cannot resolve proxy {}: {}", server_str, e);
+                continue;
+            }
+        };
+
+        let id = id.clone();
+        let region = region.clone();
+        handles.push(tokio::spawn(async move {
+            let latency = probe_single_proxy(addr, 3, 2000).await;
+            (id, addr, region, latency)
+        }));
+    }
+
+    destination::ensure_global();
+    let mut nodes = Vec::new();
+    for handle in handles {
+        if let Ok((id, addr, region, latency)) = handle.await {
+            let health = match latency {
+                Some(us) if us < 500_000 => ProxyHealth::Healthy, // < 500 ms
+                Some(_) => ProxyHealth::Degraded,                 // ≥ 500 ms
+                None => ProxyHealth::Unhealthy,                   // No response
+            };
+
+            nodes.push(ProxyNode {
+                id,
+                data_addr: addr,
+                control_addr: SocketAddrV4::new(*addr.ip(), quic_port),
+                region,
+                health,
+                latency_us: latency,
+                load: 0.0,
+            });
+        }
+    }
+
+    for node in &nodes {
+        if let Some(client_leg_us) = node.latency_us {
+            destination::observe_client_leg(node.data_addr, client_leg_us);
+        }
+    }
+
+    nodes
+}
+
+/// Select the best proxy from the configured server list using the specified
+/// strategy.
+///
+/// Probes all proxies, builds a `ProxyNode` list, and runs the
+/// `RouteSelector`.
+pub async fn select_best_proxy(
+    candidates: &[ProbeCandidate],
+    data_port: u16,
+    quic_port: u16,
+    game_server: SocketAddrV4,
+    strategy: &str,
+) -> anyhow::Result<SelectedRoute> {
+    let nodes = probe_labeled(candidates, data_port, quic_port).await;
+
+    if nodes.is_empty() {
+        anyhow::bail!("No proxy servers could be resolved");
+    }
+
+    let healthy_count = nodes
+        .iter()
+        .filter(|n| n.health == ProxyHealth::Healthy)
+        .count();
+    if healthy_count == 0 {
+        warn!("⚠️  No healthy proxies found, trying degraded nodes...");
+    }
+
+    let selector = selector_for_strategy(strategy);
+
+    selector
+        .select(game_server, &nodes)
+        .map_err(|e| anyhow::anyhow!("Route selection failed: {}", e))
+}
+
+/// Build the [`RouteSelector`] for a configured strategy name.
+///
+/// Accepted values:
+/// - `"nearest"` selects [`NearestSelector`] (lowest client-to-relay latency).
+/// - `"destination"` selects [`DestinationAwareSelector`] (whole-path ranking).
+/// - `"multipath"` selects [`DestinationAwareSelector`]; the multipath spread
+///   itself is driven by the separate `route.multipath` flag, not by this
+///   selector, so the primary relay is still chosen destination-aware.
+/// - `"ml"` selects [`MlSelector`], falling back to nearest if training fails.
+/// - anything else logs a warning and falls back to [`NearestSelector`].
+///
+/// The shipped default is `"nearest"` in config, but the historical catch-all
+/// sent every non-`"ml"` value to destination-aware selection. To keep the
+/// shipped behaviour identical, the default is expressed explicitly here as
+/// destination-aware rather than relying on a catch-all.
+fn selector_for_strategy(strategy: &str) -> Box<dyn RouteSelector> {
+    match strategy {
+        "nearest" => Box::new(NearestSelector::new()),
+        "destination" => Box::new(DestinationAwareSelector::new()),
+        "multipath" => Box::new(DestinationAwareSelector::new()),
+        "ml" => match crate::route::selector::MlSelector::with_synthetic_training(100) {
+            Ok(ml) => {
+                tracing::info!("   Using ML route selector");
+                Box::new(ml)
+            }
+            Err(e) => {
+                warn!("   ML selector failed ({}), falling back to nearest", e);
+                Box::new(NearestSelector::new())
+            }
+        },
+        other => {
+            warn!(
+                "   Unknown route strategy {:?}, falling back to nearest",
+                other
+            );
+            Box::new(NearestSelector::new())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route::RouteStrategy;
+
+    #[test]
+    fn test_strategy_maps_to_expected_selector() {
+        assert_eq!(
+            selector_for_strategy("nearest").strategy(),
+            RouteStrategy::Nearest
+        );
+        assert_eq!(
+            selector_for_strategy("destination").strategy(),
+            RouteStrategy::DestinationAware
+        );
+        assert_eq!(
+            selector_for_strategy("multipath").strategy(),
+            RouteStrategy::DestinationAware
+        );
+        let ml = selector_for_strategy("ml");
+        #[cfg(feature = "ml")]
+        assert_eq!(ml.strategy(), RouteStrategy::MlPredicted);
+        #[cfg(not(feature = "ml"))]
+        assert_eq!(ml.strategy(), RouteStrategy::Nearest);
+    }
+
+    #[test]
+    fn test_unknown_strategy_falls_back_to_nearest() {
+        assert_eq!(
+            selector_for_strategy("bogus").strategy(),
+            RouteStrategy::Nearest
+        );
+        assert_eq!(selector_for_strategy("").strategy(), RouteStrategy::Nearest);
+    }
+
+    #[test]
+    fn test_default_strategy_resolves_to_destination_aware() {
+        let default = crate::config::Config::default().route.strategy;
+        assert_eq!(default, "destination");
+        assert_eq!(
+            selector_for_strategy(&default).strategy(),
+            RouteStrategy::DestinationAware
+        );
+        assert_eq!(
+            selector_for_strategy("nearest").strategy(),
+            RouteStrategy::Nearest
+        );
+    }
+}

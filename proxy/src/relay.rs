@@ -1,0 +1,3419 @@
+//! # Proxy Packet Relay
+//!
+//! Core relay engine: receives tunnel packets from clients, strips header,
+//! forwards to game server, receives response, re-wraps, returns to client.
+//!
+//! ## Linux recvmmsg batched I/O (Item K)
+//!
+//! On Linux the inbound receive path uses `recvmmsg(2)` to drain up to 32
+//! packets per syscall, reducing per-packet syscall overhead by ~10–30× at
+//! high packet rates.  A [`BatchState`] struct holds the kernel-facing buffers
+//! and is re-initialised on every call to avoid self-referential pointer
+//! issues.  The non-Linux path falls back to a single `recv_from` per packet.
+//!
+//! ## FEC Support
+//!
+//! When a client sends version-2 packets, FEC is active:
+//! - **Inbound**: Data packets have FEC header stripped before forwarding.
+//!   Parity packets are absorbed (not forwarded) and used for recovery.
+//! - **Outbound**: Responses are FEC-encoded with the same K for the client.
+//!
+//! ## Security
+//!
+//! The relay enforces multiple security layers:
+//! 1. **Authentication**: Validates (IP + session_token) per-packet
+//! 2. **Rate limiting**: Per-client PPS and BPS limits
+//! 3. **Abuse detection**: Amplification and reflection detection
+//! 4. **Destination validation**: Blocks forwarding to private/internal IPs
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, trace, warn};
+
+use lightspeed_protocol::framing::{read_frame, write_frame, MAX_FRAME_SIZE};
+use lightspeed_protocol::{
+    build_fec_parity_packet, build_tcp_packet, decode_tcp_payload, tcp_flags, FecDecoder,
+    FecEncoder, FecHeader, Tcp5Tuple, TcpExtHeader, TcpReliable, TunnelHeader, FEC_HEADER_SIZE,
+    FEC_MAX_PAYLOAD, HEADER_SIZE,
+};
+
+/// Maximum size for a single outbound relay packet:
+/// TunnelHeader (20 B) + FecHeader (4 B) + receive buffer (2048 B).
+/// Declared as a module-level constant so the stack array in the response
+/// listener task is sized at compile time.
+const MAX_RELAY_PKT: usize = HEADER_SIZE + FEC_HEADER_SIZE + 2048;
+
+use super::abuse::{AbuseCheckResult, AbuseDetector};
+use super::auth::Authenticator;
+use super::budget::{BudgetExceeded, BudgetGuard};
+use super::geo::{GeoResolver, GeoSide};
+#[cfg(target_os = "linux")]
+use super::handoff::SessionSnapshot;
+use super::metrics::{upstream_lag, DropReason, ProxyMetrics};
+use super::rate_limit::{RateLimitResult, RateLimiter};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Socket hygiene: bounded buffers and Linux receive busy-poll
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Three deliberate decisions, each of which degrades to a no-op rather than
+// disturbing the relay:
+//
+// 1. `SO_RCVBUF`/`SO_SNDBUF` are set explicitly and bounded. Kernel defaults
+//    (often ~208 KiB) are sized for general hosts; a relay draining bursty game
+//    traffic can drop datagrams when its task is descheduled and the receive
+//    queue overflows. The data socket gets a larger request because it carries
+//    every client; each per-session egress socket gets a smaller one because
+//    hundreds can exist at once, so per-socket memory scales with sessions.
+//    Values are clamped to [`SOCK_BUF_MIN`]..[`SOCK_BUF_MAX`]. The kernel still
+//    caps the result at `net.core.rmem_max`/`wmem_max`, so the readback below,
+//    not the request, is the truth that gets logged.
+//
+// 2. On Linux, `SO_BUSY_POLL` asks the kernel to spin briefly (50 us) on a
+//    socket's receive path after a wakeup, trading CPU for lower wakeup
+//    latency. It is advisory: with the common default `net.core.busy_poll=0`
+//    it is inert, so on a default host it costs nothing and buys nothing. This
+//    is the honest cost of the option: on a host that has enabled global busy
+//    polling it burns CPU, which is why the duration is small and the option is
+//    only requested where a kernel supports it (an unsupported kernel returns
+//    ENOPROTOOPT and the relay carries on).
+//
+// 3. `sendmmsg` is deliberately NOT used. Responses are emitted one datagram at
+//    a time from a per-session Tokio `UdpSocket`, so there is no batching point
+//    to feed a multi-message send. Issuing raw `sendmmsg` on a Tokio-managed fd
+//    would also bypass the reactor's send-readiness tracking, risking a lost
+//    wakeup or a busy-loop on the exact path that must never stall. The
+//    `recvmmsg` inbound path is unchanged and remains the only batched syscall.
+
+/// Lower bound for any requested socket buffer.
+const SOCK_BUF_MIN: usize = 64 * 1024;
+/// Upper bound, so a bad value cannot ask for gigabytes per socket.
+const SOCK_BUF_MAX: usize = 16 * 1024 * 1024;
+/// Aggregate data-plane socket buffer target.
+const DATA_SOCKET_RCVBUF: usize = 4 * 1024 * 1024;
+const DATA_SOCKET_SNDBUF: usize = 4 * 1024 * 1024;
+/// Per-session game-server socket buffer target.
+const SESSION_SOCKET_RCVBUF: usize = 512 * 1024;
+const SESSION_SOCKET_SNDBUF: usize = 512 * 1024;
+/// Linux `SO_BUSY_POLL` duration, in microseconds.
+#[cfg(target_os = "linux")]
+const BUSY_POLL_US: u32 = 50;
+
+/// Which relay socket is being tuned; selects the buffer policy.
+#[derive(Clone, Copy, Debug)]
+enum SocketRole {
+    Data,
+    Session,
+}
+
+impl SocketRole {
+    fn rcvbuf(self) -> usize {
+        match self {
+            Self::Data => DATA_SOCKET_RCVBUF,
+            Self::Session => SESSION_SOCKET_RCVBUF,
+        }
+    }
+
+    fn sndbuf(self) -> usize {
+        match self {
+            Self::Data => DATA_SOCKET_SNDBUF,
+            Self::Session => SESSION_SOCKET_SNDBUF,
+        }
+    }
+}
+
+/// What actually happened when a socket was tuned. `*_effective` is the kernel's
+/// readback (after its own cap/doubling), `None` when the option was refused.
+#[derive(Debug, Clone, Copy, Default)]
+struct SocketTuningReport {
+    rcvbuf_wanted: u32,
+    rcvbuf_effective: Option<u32>,
+    sndbuf_wanted: u32,
+    sndbuf_effective: Option<u32>,
+    busy_poll: Option<u32>,
+    failures: u32,
+}
+
+/// Clamp a requested buffer size into the sane window.
+fn clamp_buf(bytes: usize) -> u32 {
+    bytes.clamp(SOCK_BUF_MIN, SOCK_BUF_MAX) as u32
+}
+
+#[cfg(target_os = "linux")]
+fn set_int_opt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `value` is a live c_int and the length is exactly its size, so
+    // setsockopt reads only initialised bytes for the duration of the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of!(value).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_int_opt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    name: libc::c_int,
+) -> std::io::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value` and `len` are valid out-pointers, and the kernel writes
+    // at most `len` initialised bytes into them.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of_mut!(value).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Ok(value)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Apply bounded buffers and, on Linux, busy-poll to an already-bound fd.
+///
+/// Every step is independent: a refused option increments `failures` and the
+/// caller's metrics but never aborts the socket. `fd = -1` exercises the whole
+/// failure path in tests.
+#[cfg(target_os = "linux")]
+fn configure_socket_fd(
+    fd: libc::c_int,
+    role: SocketRole,
+    metrics: &ProxyMetrics,
+) -> SocketTuningReport {
+    let mut report = SocketTuningReport {
+        rcvbuf_wanted: clamp_buf(role.rcvbuf()),
+        sndbuf_wanted: clamp_buf(role.sndbuf()),
+        ..Default::default()
+    };
+
+    match set_int_opt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        report.rcvbuf_wanted as libc::c_int,
+    ) {
+        Ok(()) => {
+            metrics.record_socket_option(true);
+            report.rcvbuf_effective = get_int_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)
+                .ok()
+                .map(|v| v as u32);
+        }
+        Err(e) => {
+            metrics.record_socket_option(false);
+            report.failures += 1;
+            debug!(error = %e, role = ?role, "SO_RCVBUF refused; using kernel default");
+        }
+    }
+
+    match set_int_opt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_SNDBUF,
+        report.sndbuf_wanted as libc::c_int,
+    ) {
+        Ok(()) => {
+            metrics.record_socket_option(true);
+            report.sndbuf_effective = get_int_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF)
+                .ok()
+                .map(|v| v as u32);
+        }
+        Err(e) => {
+            metrics.record_socket_option(false);
+            report.failures += 1;
+            debug!(error = %e, role = ?role, "SO_SNDBUF refused; using kernel default");
+        }
+    }
+
+    match set_int_opt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_BUSY_POLL,
+        BUSY_POLL_US as libc::c_int,
+    ) {
+        Ok(()) => {
+            metrics.record_socket_option(true);
+            metrics.record_busy_poll_enabled();
+            report.busy_poll = Some(BUSY_POLL_US);
+        }
+        Err(e) => {
+            metrics.record_socket_option(false);
+            report.failures += 1;
+            // Expected on kernels without SO_BUSY_POLL; not a problem.
+            debug!(error = %e, role = ?role, "SO_BUSY_POLL unavailable");
+        }
+    }
+
+    report
+}
+
+/// Tune a bound Tokio UDP socket. On Linux this really calls the kernel; on
+/// other targets it reports the requested sizes only.
+#[cfg(target_os = "linux")]
+fn configure_socket(
+    socket: &UdpSocket,
+    role: SocketRole,
+    metrics: &ProxyMetrics,
+) -> SocketTuningReport {
+    use std::os::fd::AsRawFd;
+    configure_socket_fd(socket.as_raw_fd(), role, metrics)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_socket(
+    socket: &UdpSocket,
+    role: SocketRole,
+    metrics: &ProxyMetrics,
+) -> SocketTuningReport {
+    let _ = (socket, metrics);
+    SocketTuningReport {
+        rcvbuf_wanted: clamp_buf(role.rcvbuf()),
+        sndbuf_wanted: clamp_buf(role.sndbuf()),
+        ..Default::default()
+    }
+}
+
+/// Tune and report the single aggregate data-plane socket at loop start.
+fn configure_data_socket(data_socket: &UdpSocket, metrics: &ProxyMetrics) {
+    let report = configure_socket(data_socket, SocketRole::Data, metrics);
+    info!(
+        role = "data",
+        rcvbuf_wanted = report.rcvbuf_wanted,
+        rcvbuf_effective = ?report.rcvbuf_effective,
+        sndbuf_wanted = report.sndbuf_wanted,
+        sndbuf_effective = ?report.sndbuf_effective,
+        busy_poll_us = ?report.busy_poll,
+        refusals = report.failures,
+        "Data socket tuned"
+    );
+}
+
+/// Tune one per-session egress socket; a refusal is logged, never fatal.
+fn configure_session_socket(socket: &UdpSocket, metrics: &ProxyMetrics) -> SocketTuningReport {
+    let report = configure_socket(socket, SocketRole::Session, metrics);
+    if report.failures > 0 {
+        debug!(
+            refusals = report.failures,
+            "Session socket tuning degraded; using kernel defaults"
+        );
+    }
+    report
+}
+
+/// How responses are written back to a client.
+///
+/// UDP sessions send raw datagrams to the client's bound address.  TCP
+/// sessions write length-prefixed frames to the shared write half, guarded by
+/// a [`CancellationToken`] so an in-flight send observes connection teardown.
+#[derive(Clone)]
+pub enum ClientSender {
+    Udp {
+        socket: Arc<UdpSocket>,
+        addr: SocketAddrV4,
+    },
+    Tcp {
+        write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
+        cancel: CancellationToken,
+    },
+}
+
+impl std::fmt::Debug for ClientSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientSender::Udp { socket, addr } => f
+                .debug_struct("Udp")
+                .field("socket", socket)
+                .field("addr", addr)
+                .finish(),
+            ClientSender::Tcp { cancel, .. } => f
+                .debug_struct("Tcp")
+                .field("cancelled", &cancel.is_cancelled())
+                .finish(),
+        }
+    }
+}
+
+impl ClientSender {
+    /// Send `bytes` to the client.  Returns the number of bytes written.
+    pub async fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ClientSender::Udp { socket, addr } => socket.send_to(bytes, addr).await,
+            ClientSender::Tcp { write, cancel } => {
+                if cancel.is_cancelled() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "session cancelled",
+                    ));
+                }
+                let mut guard = write.lock().await;
+                write_frame(&mut *guard, bytes).await?;
+                Ok(bytes.len())
+            }
+        }
+    }
+
+    /// Whether this sender writes to a TCP connection.
+    pub fn is_tcp(&self) -> bool {
+        matches!(self, ClientSender::Tcp { .. })
+    }
+}
+
+/// Get current timestamp in microseconds (wrapping u32).
+fn now_us() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u32
+}
+
+/// Tracks an active client tunnel session.
+#[derive(Debug)]
+pub struct ClientSession {
+    /// Client's address (for sending responses back).
+    pub client_addr: SocketAddrV4,
+    /// Game server this client is connected to.
+    pub game_server: SocketAddrV4,
+    /// Outbound socket for forwarding to game server.
+    pub outbound_socket: Arc<UdpSocket>,
+    /// How responses are sent back to the client (UDP or TCP).
+    pub sender: ClientSender,
+    /// Cancellation token, fired when the session is torn down so the
+    /// response listener can observe the close and stop reading.
+    pub cancel: CancellationToken,
+    /// Packets relayed in this session.
+    pub packets_relayed: u64,
+    /// Bytes relayed in this session.
+    pub bytes_relayed: u64,
+    /// Session start time (monotonic epoch for all session durations).
+    pub started_at: Instant,
+    /// Microseconds since [`Self::started_at`] at the last activity, or 0 if
+    /// the session has seen no traffic yet.  Written via [`Self::touch`].
+    last_activity_us: AtomicU64,
+    /// Microseconds since [`Self::started_at`] when the client packet currently
+    /// awaiting a response was forwarded to the game server, or 0 when no
+    /// forward is outstanding.  Written immediately before the upstream
+    /// `send_to` for the normal and FEC-recovery paths, and cleared by the
+    /// first response read on the session socket via `swap(0)`, so at most one
+    /// latency sample is attributed per forward.  Refers to the most recent
+    /// forward; a subsequent forward overwrites it.
+    pub pending_forward_us: AtomicU64,
+    /// Response sequence counter (FEC responses).
+    pub response_seq: AtomicU16,
+    /// Last client packet sequence seen (echoed in non-FEC responses so the
+    /// client can dedupe multipath duplicate responses).
+    pub last_client_seq: AtomicU16,
+    /// Whether this client uses FEC (detected from first v2 packet).
+    pub fec_enabled: bool,
+    /// FEC block size (K) from the client's packets.
+    pub fec_k: u8,
+    /// FEC decoder for inbound packets (client → proxy).
+    /// Protected by tokio Mutex since it's accessed from the inbound loop.
+    pub fec_decoder: tokio::sync::Mutex<FecDecoder>,
+    /// Idempotent claim flag for the response-listener task.
+    ///
+    /// `false` → no listener owns this session yet; `true` → one has been
+    /// spawned.  Only the site that flips this from `false` to `true` may
+    /// spawn [`run_session_response_listener`], which guarantees exactly one
+    /// listener per session.
+    listener_started: AtomicBool,
+    /// Number of times [`ClientSession::claim_response_listener`] has won.
+    /// Always 0 or 1; used by tests to prove single registration.
+    listeners_spawned: AtomicU64,
+}
+
+impl ClientSession {
+    /// Claim ownership of this session's response-listener task.
+    ///
+    /// Returns `true` for exactly one caller; every subsequent caller gets
+    /// `false`.  Only the winning caller may spawn
+    /// [`run_session_response_listener`] for this session.
+    pub fn claim_response_listener(&self) -> bool {
+        if self
+            .listener_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.listeners_spawned.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Number of response listeners successfully claimed for this session.
+    ///
+    /// Always 0 or 1; exposed so tests can prove single registration.
+    pub fn response_listeners_spawned(&self) -> u64 {
+        self.listeners_spawned.load(Ordering::Relaxed)
+    }
+
+    /// Refresh this session's activity clock.
+    ///
+    /// Stores the current instant, as microseconds since [`Self::started_at`],
+    /// into the lock-free activity field.  Safe to call concurrently from the
+    /// inbound packet path and the response listener; a load racing a store on
+    /// [`Ordering::Relaxed`] can only observe a slightly stale timestamp, which
+    /// is harmless for an advisory liveness check.
+    pub fn touch(&self) {
+        self.last_activity_us.store(
+            self.started_at.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Microseconds of idle time since this session's last activity.
+    ///
+    /// Computed in the monotonic [`Self::started_at`] clock as
+    /// `now_micros - last_activity_us`.  A never-touched session reports its
+    /// full age (the stored value is 0), and the subtraction saturates at zero
+    /// so a timestamp that appears to be in the future can never underflow.
+    pub fn idle_micros(&self) -> u64 {
+        (self.started_at.elapsed().as_micros() as u64)
+            .saturating_sub(self.last_activity_us.load(Ordering::Relaxed))
+    }
+}
+
+/// Command sent from the inbound packet path to a TCP connection task. The
+/// task buffers these until the upstream dial completes, then applies them in
+/// arrival order.
+enum TcpCmd {
+    /// A game stream payload to write to the real server.
+    Data(bytes::Bytes),
+    /// The client finished sending; shut the write half toward the server.
+    Fin,
+}
+
+/// Proxy-side connection state for one TCP-tunnelled game connection, keyed
+/// by its 5-tuple (see [`Tcp5Tuple`]).
+///
+/// The tunnel is one UDP socket per client, so the client's UDP source port
+/// is deliberately not part of the key; the 5-tuple is carried verbatim in
+/// the tunnel header and is what gets dialled on the server side.
+pub struct TcpConnState {
+    /// The connection's 5-tuple (game source and destination).
+    pub tuple: Tcp5Tuple,
+    /// The shared sequenced-reliable channel for this connection. The receiver
+    /// orders client→server bytes; the sender sequences server→client bytes.
+    /// Mutex-protected because the inbound path and the connection task each
+    /// hold one side.
+    pub reliable: tokio::sync::Mutex<TcpReliable>,
+    /// Outbound command channel toward the connection task. `None` once the
+    /// task has been spawned and taken its receiver.
+    conn_tx: std::sync::Mutex<Option<mpsc::Sender<TcpCmd>>>,
+    /// Inbound command channel receiver, owned by the connection task.
+    conn_rx: std::sync::Mutex<Option<mpsc::Receiver<TcpCmd>>>,
+    /// Cancellation token: fired on RST, idle expiry, or upstream teardown.
+    cancel: CancellationToken,
+    /// FEC decoder for inbound v5 packets on this connection. A block's data
+    /// and parity packets converge here so recovery targets the right stream.
+    pub fec_decoder: tokio::sync::Mutex<FecDecoder>,
+    /// Last activity instant, for the idle sweep.
+    last_activity: std::sync::Mutex<Instant>,
+    /// FEC block size (K) the client uses on this leg, captured from the SYN.
+    pub fec_k: u8,
+    /// Set once the upstream dial completes; the task alone writes it.
+    established: AtomicBool,
+    /// Last client packet sequence seen (echoed in responses for dedup).
+    pub last_client_seq: AtomicU16,
+}
+
+impl TcpConnState {
+    /// Create the state and its command channel. `fec_k` is the client leg's
+    /// FEC block size; `cancel` is the shared teardown signal.
+    pub fn new(tuple: Tcp5Tuple, fec_k: u8, cancel: CancellationToken) -> Self {
+        let (tx, rx) = mpsc::channel(64);
+        Self {
+            tuple,
+            reliable: tokio::sync::Mutex::new(TcpReliable::new(2, 2)),
+            conn_tx: std::sync::Mutex::new(Some(tx)),
+            conn_rx: std::sync::Mutex::new(Some(rx)),
+            cancel,
+            fec_decoder: tokio::sync::Mutex::new(FecDecoder::new()),
+            last_activity: std::sync::Mutex::new(Instant::now()),
+            fec_k,
+            established: AtomicBool::new(false),
+            last_client_seq: AtomicU16::new(0),
+        }
+    }
+
+    /// Take the command channel sender, returning `None` once taken.
+    fn take_conn_tx(&self) -> Option<mpsc::Sender<TcpCmd>> {
+        self.conn_tx.lock().unwrap().take()
+    }
+
+    /// Take the command channel receiver, returning `None` once taken.
+    fn take_conn_rx(&self) -> Option<mpsc::Receiver<TcpCmd>> {
+        self.conn_rx.lock().unwrap().take()
+    }
+
+    /// Refresh this connection's activity clock.
+    pub fn touch(&self) {
+        *self.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    /// Idle time since the last activity.
+    pub fn idle(&self) -> Duration {
+        self.last_activity.lock().unwrap().elapsed()
+    }
+}
+
+/// Proxy-side geo aggregation context bound to a relay engine.
+///
+/// When present, a newly created session resolves both endpoints to country
+/// codes and folds the pair into [`ProxyMetrics`]; lookup misses and
+/// self-tunnels are counted in their own families. No raw IP is retained.
+#[derive(Clone)]
+pub struct GeoState {
+    /// Resolves an IP to its two-letter country code.
+    pub resolver: Arc<dyn GeoResolver>,
+    /// Metrics collector the geo cells are recorded into.
+    pub metrics: Arc<ProxyMetrics>,
+    /// This relay's public IP, when known. Enables exact address-based
+    /// self-tunnel detection; the port heuristic is the fallback.
+    pub public_ip: Option<Ipv4Addr>,
+    /// Control-plane port used by the port-based self-tunnel fallback.
+    pub control_port: u16,
+    /// Data-plane port used by the port-based self-tunnel fallback.
+    pub data_port: u16,
+}
+
+/// The relay engine, manages all active tunnel sessions.
+pub struct RelayEngine {
+    /// Active client sessions indexed by client address.
+    sessions: Arc<RwLock<HashMap<SocketAddrV4, Arc<ClientSession>>>>,
+    /// Active TCP-tunnelled connections, keyed by their 5-tuple. Separate from
+    /// [`Self::sessions`] (keyed by client address, bound to the UDP data
+    /// plane) so the UDP session sweep never sees TCP keys.
+    tcp_conns: Arc<RwLock<HashMap<Tcp5Tuple, Arc<TcpConnState>>>>,
+    /// Maximum concurrent sessions.
+    max_sessions: usize,
+    /// Session timeout (no activity).
+    session_timeout: Duration,
+    /// Join handles for response-listener tasks spawned outside the manager.
+    ///
+    /// The immediate spawn in [`process_inbound_packet`] is otherwise detached,
+    /// so its handle is parked here and the periodic manager aborts it once the
+    /// session disappears.  Without this, an expired session (no FIN) would leak
+    /// its listener task forever.  Manager-created handles stay in the manager's
+    /// local `known_sessions`, which it already aborts.
+    listener_handles: Arc<tokio::sync::Mutex<HashMap<SocketAddrV4, tokio::task::JoinHandle<()>>>>,
+    /// Set while an in-place handoff is staged: new sessions are refused but
+    /// existing sessions keep resolving.
+    handoff_frozen: AtomicBool,
+    /// Proxy-side geo aggregation, or `None` when geo is disabled.
+    geo: Option<GeoState>,
+    /// Sink for per-session socket-tuning observations. Defaults to a private
+    /// collector so engine unit tests need no wiring; production attaches the
+    /// process collector with [`RelayEngine::with_metrics`].
+    socket_metrics: Arc<ProxyMetrics>,
+    /// Optional egress budget guard. `None` (the default) disables the guard
+    /// entirely, so a relay with no budget behaves exactly as before.
+    budget: Option<Arc<BudgetGuard>>,
+}
+
+impl RelayEngine {
+    /// Create a new relay engine with the default 300 s session timeout.
+    pub fn new(max_sessions: usize) -> Self {
+        Self::new_with_timeout(max_sessions, Duration::from_secs(300)) // 5 min
+    }
+
+    /// Create a new relay engine with an explicit session timeout.
+    ///
+    /// Test seam: production code uses [`Self::new`] and its fixed 300 s
+    /// timeout, while unit tests pass a short timeout so session expiry can be
+    /// exercised without sleeping for minutes.
+    pub fn new_with_timeout(max_sessions: usize, session_timeout: Duration) -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            tcp_conns: Arc::new(RwLock::new(HashMap::new())),
+            max_sessions,
+            session_timeout,
+            listener_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            handoff_frozen: AtomicBool::new(false),
+            geo: None,
+            socket_metrics: Arc::new(ProxyMetrics::new()),
+            budget: None,
+        }
+    }
+
+    /// Attach proxy-side geo aggregation to this engine.
+    pub fn with_geo(mut self, geo: GeoState) -> Self {
+        self.geo = Some(geo);
+        self
+    }
+
+    /// Attach the process metrics collector for socket-tuning observations.
+    pub fn with_metrics(mut self, metrics: Arc<ProxyMetrics>) -> Self {
+        self.socket_metrics = metrics;
+        self
+    }
+
+    /// Attach the egress budget guard.
+    ///
+    /// Omitted by default; when absent the hard threshold is never enforced.
+    pub fn with_budget(mut self, budget: Arc<BudgetGuard>) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Evaluate the egress budget against `metrics` and publish the result.
+    ///
+    /// Called periodically by the session manager so the soft threshold is
+    /// logged and exported even when no new session is attempted. A no-op when
+    /// no guard is attached.
+    pub fn observe_budget(&self, metrics: &ProxyMetrics) {
+        let Some(budget) = &self.budget else {
+            return;
+        };
+        let used = metrics.bytes_relayed.load(Ordering::Relaxed);
+        budget.observe(used, super::budget::current_month_key(), metrics);
+    }
+
+    /// Record a newly created session's country pair, when geo is enabled.
+    ///
+    /// A self-tunnel is counted and skipped, and a resolver miss on either
+    /// side counts a miss instead of a pair. Called only from the single
+    /// new-session insert site, so a session is recorded at most once.
+    fn record_geo_session(&self, session: &ClientSession) {
+        let Some(geo) = &self.geo else {
+            return;
+        };
+        let dst = session.game_server.ip();
+        let self_tunnel = match geo.public_ip {
+            Some(public_ip) => *dst == public_ip,
+            None => {
+                // Fallback when [server] public_ip is unset: only the QUIC
+                // control port is a strong self-tunnel signal. The data port
+                // is deliberately excluded because game traffic can
+                // legitimately use 4434, and dropping it would hide real
+                // demand. Operators should set public_ip for an exact match.
+                session.game_server.port() == geo.control_port
+            }
+        };
+        if self_tunnel {
+            geo.metrics.record_geo_self_tunnel_skip();
+            return;
+        }
+        let src = session.client_addr.ip();
+        let Some(src_country) = geo.resolver.country(*src) else {
+            geo.metrics.record_geo_miss(GeoSide::Src);
+            return;
+        };
+        let Some(dst_country) = geo.resolver.country(*dst) else {
+            geo.metrics.record_geo_miss(GeoSide::Dst);
+            return;
+        };
+        geo.metrics.record_geo_session(&src_country, &dst_country);
+    }
+
+    /// Refuse new session creation while an in-place handoff is prepared.
+    ///
+    /// The window is milliseconds, and existing sessions keep resolving.
+    pub fn freeze_handoff(&self) {
+        self.handoff_frozen.store(true, Ordering::Release);
+    }
+
+    /// Resume accepting new sessions after a handoff attempt did not exec.
+    pub fn unfreeze_handoff(&self) {
+        self.handoff_frozen.store(false, Ordering::Release);
+    }
+
+    /// Whether new-session creation is currently frozen for a handoff.
+    pub fn is_handoff_frozen(&self) -> bool {
+        self.handoff_frozen.load(Ordering::Acquire)
+    }
+
+    /// Get the number of active sessions.
+    pub async fn active_sessions(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
+    /// Check if we can accept a new session.
+    pub async fn can_accept(&self) -> bool {
+        self.sessions.read().await.len() < self.max_sessions
+    }
+
+    /// Get or create a session for a client.
+    ///
+    /// If the client already has an active session, returns `(session, false)`.
+    /// Otherwise, creates a new outbound socket and session, returning `(session, true)`.
+    /// The caller should spawn a response listener when `is_new` is true.
+    pub async fn get_or_create_session(
+        &self,
+        client_addr: SocketAddrV4,
+        game_server: SocketAddrV4,
+        fec_enabled: bool,
+        fec_k: u8,
+        sender: ClientSender,
+    ) -> anyhow::Result<(Arc<ClientSession>, bool)> {
+        // Fast path: check existing session
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(session) = sessions.get(&client_addr) {
+                return Ok((Arc::clone(session), false));
+            }
+        }
+
+        // Slow path: create new session. A staged handoff admits no new
+        // sessions, but the fast path above already served existing ones.
+        if self.is_handoff_frozen() {
+            anyhow::bail!("handoff in progress: refusing to create a new session");
+        }
+        // Egress budget: refuse only NEW sessions at the hard threshold. The
+        // fast path above already returned any existing session, so live
+        // traffic is never interrupted.
+        if let Some(budget) = &self.budget {
+            let used = self.socket_metrics.bytes_relayed.load(Ordering::Relaxed);
+            budget
+                .check_new_session(used, super::budget::current_month_key())
+                .map_err(anyhow::Error::from)?;
+        }
+        if !self.can_accept().await {
+            anyhow::bail!("Max sessions ({}) reached", self.max_sessions);
+        }
+
+        // Bind a new outbound socket for this client's game traffic
+        let outbound_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let tuning = configure_session_socket(&outbound_socket, &self.socket_metrics);
+
+        // A TCP session shares its connection's cancellation token so the
+        // response listener stops when the connection drops; UDP sessions get
+        // an independent token.
+        let cancel = match &sender {
+            ClientSender::Udp { .. } => CancellationToken::new(),
+            ClientSender::Tcp { cancel, .. } => cancel.clone(),
+        };
+
+        info!(
+            client = %client_addr,
+            game_server = %game_server,
+            outbound_port = %outbound_socket.local_addr()?,
+            rcvbuf_effective = ?tuning.rcvbuf_effective,
+            sndbuf_effective = ?tuning.sndbuf_effective,
+            fec = fec_enabled,
+            "New client session created"
+        );
+
+        let session = Arc::new(ClientSession {
+            client_addr,
+            game_server,
+            outbound_socket: Arc::new(outbound_socket),
+            sender,
+            cancel,
+            packets_relayed: 0,
+            bytes_relayed: 0,
+            started_at: Instant::now(),
+            last_activity_us: AtomicU64::new(0),
+            pending_forward_us: AtomicU64::new(0),
+            response_seq: AtomicU16::new(0),
+            last_client_seq: AtomicU16::new(0),
+            fec_enabled,
+            fec_k,
+            fec_decoder: tokio::sync::Mutex::new(FecDecoder::new()),
+            listener_started: AtomicBool::new(false),
+            listeners_spawned: AtomicU64::new(0),
+        });
+
+        let mut sessions = self.sessions.write().await;
+        // Re-check the freeze under the write lock: a request that passed the
+        // earlier check but stalled must not insert a session after the handoff
+        // snapshot was taken. Re-check for a concurrent creator so this insert
+        // cannot clobber an existing session.
+        if self.is_handoff_frozen() {
+            anyhow::bail!("handoff in progress: refusing to create a new session");
+        }
+        if let Some(existing) = sessions.get(&client_addr) {
+            return Ok((Arc::clone(existing), false));
+        }
+        sessions.insert(client_addr, Arc::clone(&session));
+        drop(sessions);
+        self.record_geo_session(&session);
+
+        Ok((session, true))
+    }
+
+    /// Get a shared reference to the sessions map (for the response listener).
+    pub fn sessions(&self) -> Arc<RwLock<HashMap<SocketAddrV4, Arc<ClientSession>>>> {
+        Arc::clone(&self.sessions)
+    }
+
+    /// Clean up expired sessions.
+    ///
+    /// A session expires once its idle time (see [`ClientSession::idle_micros`])
+    /// reaches the configured timeout.  Dropping a session cancels its token so
+    /// any response-listener task parked on it exits promptly.
+    pub async fn cleanup_expired(&self) -> usize {
+        let timeout = self.session_timeout;
+        let mut sessions = self.sessions.write().await;
+        let before = sessions.len();
+        sessions.retain(|addr, session| {
+            let keep = session.idle_micros() < timeout.as_micros() as u64;
+            if !keep {
+                session.cancel.cancel();
+                info!(client = %addr, "Session expired after {:?}", session.started_at.elapsed());
+            }
+            keep
+        });
+        before - sessions.len()
+    }
+
+    /// Park a response-listener join handle so the session manager can abort
+    /// it after the session is removed.
+    ///
+    /// If a stale handle already exists for `addr` (client address reused after
+    /// an expiry that fired no cancellation), it is aborted first so it cannot
+    /// outlive its session.
+    pub async fn register_listener_handle(
+        &self,
+        addr: SocketAddrV4,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let mut handles = self.listener_handles.lock().await;
+        if let Some(previous) = handles.insert(addr, handle) {
+            previous.abort();
+        }
+    }
+
+    /// Abort and forget every parked listener handle whose session is no longer
+    /// active.
+    pub async fn reap_listener_handles(&self, active: &HashMap<SocketAddrV4, Arc<ClientSession>>) {
+        let mut handles = self.listener_handles.lock().await;
+        handles.retain(|addr, handle| {
+            if active.contains_key(addr) {
+                true
+            } else {
+                handle.abort();
+                false
+            }
+        });
+    }
+
+    /// Number of active TCP-tunnelled connections.
+    pub async fn tcp_connection_count(&self) -> usize {
+        self.tcp_conns.read().await.len()
+    }
+
+    /// Get or create the TCP connection for a 5-tuple.
+    ///
+    /// Creation counts like one session: it obeys `max_sessions` (against the
+    /// UDP session count plus the TCP connection count) and the egress budget
+    /// hard threshold. Returns `(state, true)` on creation and
+    /// `(state, false)` when the connection already existed.
+    pub async fn get_or_create_tcp_connection(
+        &self,
+        tuple: Tcp5Tuple,
+        fec_k: u8,
+    ) -> anyhow::Result<(Arc<TcpConnState>, bool)> {
+        {
+            let conns = self.tcp_conns.read().await;
+            if let Some(existing) = conns.get(&tuple) {
+                return Ok((Arc::clone(existing), false));
+            }
+        }
+
+        if self.is_handoff_frozen() {
+            anyhow::bail!("handoff in progress: refusing to create a TCP connection");
+        }
+        if let Some(budget) = &self.budget {
+            let used = self.socket_metrics.bytes_relayed.load(Ordering::Relaxed);
+            budget
+                .check_new_session(used, super::budget::current_month_key())
+                .map_err(anyhow::Error::from)?;
+        }
+
+        let conn = Arc::new(TcpConnState::new(tuple, fec_k, CancellationToken::new()));
+        let mut conns = self.tcp_conns.write().await;
+        if self.is_handoff_frozen() {
+            anyhow::bail!("handoff in progress: refusing to create a TCP connection");
+        }
+        if let Some(existing) = conns.get(&tuple) {
+            return Ok((Arc::clone(existing), false));
+        }
+        // The shared session budget: one UDP session plus one TCP connection
+        // must not exceed `max_sessions`.
+        let total = self.sessions.read().await.len() + conns.len();
+        if total >= self.max_sessions {
+            anyhow::bail!("Max sessions ({}) reached", self.max_sessions);
+        }
+        conns.insert(tuple, Arc::clone(&conn));
+        Ok((conn, true))
+    }
+
+    /// Remove a TCP connection from the table, cancelling its task.
+    pub async fn remove_tcp_connection(&self, tuple: &Tcp5Tuple) -> Option<Arc<TcpConnState>> {
+        let conn = self.tcp_conns.write().await.remove(tuple);
+        if let Some(conn) = &conn {
+            conn.cancel.cancel();
+        }
+        conn
+    }
+
+    /// Access the TCP connection table (for the connection tasks' teardown).
+    fn tcp_table(&self) -> Arc<RwLock<HashMap<Tcp5Tuple, Arc<TcpConnState>>>> {
+        Arc::clone(&self.tcp_conns)
+    }
+
+    /// Sweep TCP connections idle past the session timeout: RST both sides by
+    /// cancelling the connection task and dropping the entry. Returns how many
+    /// were removed.
+    pub async fn cleanup_expired_tcp(&self) -> usize {
+        let timeout = self.session_timeout;
+        let expired: Vec<Tcp5Tuple> = {
+            let conns = self.tcp_conns.read().await;
+            conns
+                .iter()
+                .filter_map(|(tuple, conn)| (conn.idle() >= timeout).then_some(*tuple))
+                .collect()
+        };
+        let removed = expired.len();
+        for tuple in expired {
+            if let Some(conn) = self.remove_tcp_connection(&tuple).await {
+                info!(
+                    src = %conn.tuple.src_ip,
+                    src_port = conn.tuple.src_port,
+                    dst = %conn.tuple.dst_ip,
+                    dst_port = conn.tuple.dst_port,
+                    "TCP connection expired after {:?}",
+                    conn.idle()
+                );
+            }
+        }
+        removed
+    }
+
+    /// Snapshot every UDP session for an in-place handoff.
+    ///
+    /// FEC decoder state and `pending_forward_us` are intentionally not carried:
+    /// the decoder is rebuilt by the adopting process and the latency marker is
+    /// zeroed so no post-handoff response is charged a bogus lag.  TCP sessions
+    /// cannot survive an `execve` (their write half lives in this process) and
+    /// are skipped.
+    #[cfg(target_os = "linux")]
+    pub fn snapshot_handoff(&self, now: Instant) -> Vec<SessionSnapshot> {
+        use std::os::fd::AsRawFd;
+
+        let sessions = self.sessions.blocking_read();
+        let mut snapshots = Vec::with_capacity(sessions.len());
+        let mut tcp_skipped = 0usize;
+        for session in sessions.values() {
+            if session.sender.is_tcp() {
+                tcp_skipped += 1;
+                continue;
+            }
+            let age_us = now
+                .saturating_duration_since(session.started_at)
+                .as_micros() as u64;
+            let last_activity_us = session.last_activity_us.load(Ordering::Relaxed);
+            snapshots.push(SessionSnapshot {
+                client_addr: session.client_addr.to_string(),
+                game_server: session.game_server.to_string(),
+                outbound_fd: session.outbound_socket.as_raw_fd(),
+                fec_enabled: session.fec_enabled,
+                fec_k: session.fec_k,
+                age_us,
+                idle_us: age_us.saturating_sub(last_activity_us),
+                response_seq: session.response_seq.load(Ordering::Relaxed),
+                last_client_seq: session.last_client_seq.load(Ordering::Relaxed),
+                packets_relayed: session.packets_relayed,
+                bytes_relayed: session.bytes_relayed,
+            });
+        }
+        drop(sessions);
+        if tcp_skipped > 0 {
+            info!(
+                tcp_sessions_skipped = tcp_skipped,
+                "Handoff snapshot skipped TCP sessions"
+            );
+        }
+        snapshots
+    }
+
+    /// Adopt snapshotted sessions into this engine.
+    ///
+    /// Each snapshot's outbound fd is validated and adopted into a fresh
+    /// non-blocking socket, a new [`ClientSession`] is built (new FEC decoder,
+    /// new cancellation token, re-anchored age, preserved activity and
+    /// counters), and its response listener is spawned immediately.  An address
+    /// that already has a session, or whose fd fails validation, is skipped.
+    /// Returns the number of sessions installed.
+    #[cfg(target_os = "linux")]
+    pub async fn install_handoff_sessions(
+        &self,
+        snaps: &[SessionSnapshot],
+        data_socket: Arc<UdpSocket>,
+        metrics: Arc<ProxyMetrics>,
+    ) -> usize {
+        let mut installed = 0usize;
+        for snap in snaps {
+            let client_addr: SocketAddrV4 = match snap.client_addr.parse() {
+                Ok(addr) => addr,
+                Err(_) => {
+                    warn!(
+                        client = %snap.client_addr,
+                        "Skipping handoff session with unparseable client_addr"
+                    );
+                    crate::handoff::close_fd(snap.outbound_fd);
+                    continue;
+                }
+            };
+            let game_server: SocketAddrV4 = match snap.game_server.parse() {
+                Ok(addr) => addr,
+                Err(_) => {
+                    warn!(
+                        client = %snap.client_addr,
+                        "Skipping handoff session with unparseable game_server"
+                    );
+                    crate::handoff::close_fd(snap.outbound_fd);
+                    continue;
+                }
+            };
+
+            {
+                let sessions = self.sessions.read().await;
+                if sessions.contains_key(&client_addr) {
+                    debug!(
+                        client = %client_addr,
+                        "Handoff session address already active, skipping"
+                    );
+                    drop(sessions);
+                    crate::handoff::close_fd(snap.outbound_fd);
+                    continue;
+                }
+            }
+
+            let std_socket = match crate::handoff::adopt_std_udp(snap.outbound_fd) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    warn!(
+                        client = %client_addr,
+                        fd = snap.outbound_fd,
+                        error = %e,
+                        "Skipping handoff session with invalid outbound fd"
+                    );
+                    continue;
+                }
+            };
+            let outbound_socket = match UdpSocket::from_std(std_socket) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    warn!(
+                        client = %client_addr,
+                        error = %e,
+                        "Skipping handoff session: cannot register adopted socket"
+                    );
+                    continue;
+                }
+            };
+            configure_session_socket(&outbound_socket, &metrics);
+
+            // Seal the adopted fd here, where ownership is established, so the
+            // caller never touches fds of snapshots that were skipped/closed.
+            let _ = crate::handoff::set_cloexec(snap.outbound_fd);
+
+            let age = Duration::from_micros(snap.age_us);
+            let started_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+            let session = Arc::new(ClientSession {
+                client_addr,
+                game_server,
+                outbound_socket: Arc::new(outbound_socket),
+                sender: ClientSender::Udp {
+                    socket: Arc::clone(&data_socket),
+                    addr: client_addr,
+                },
+                cancel: CancellationToken::new(),
+                packets_relayed: snap.packets_relayed,
+                bytes_relayed: snap.bytes_relayed,
+                started_at,
+                last_activity_us: AtomicU64::new(snap.age_us.saturating_sub(snap.idle_us)),
+                pending_forward_us: AtomicU64::new(0),
+                response_seq: AtomicU16::new(snap.response_seq),
+                last_client_seq: AtomicU16::new(snap.last_client_seq),
+                fec_enabled: snap.fec_enabled,
+                fec_k: snap.fec_k,
+                fec_decoder: tokio::sync::Mutex::new(FecDecoder::new()),
+                listener_started: AtomicBool::new(false),
+                listeners_spawned: AtomicU64::new(0),
+            });
+
+            {
+                let mut sessions = self.sessions.write().await;
+                if sessions.contains_key(&client_addr) {
+                    continue;
+                }
+                sessions.insert(client_addr, Arc::clone(&session));
+            }
+
+            metrics.record_session_created();
+            if session.claim_response_listener() {
+                let session_clone = Arc::clone(&session);
+                let metrics_clone = Arc::clone(&metrics);
+                let handle = tokio::spawn(async move {
+                    run_session_response_listener(session_clone, metrics_clone).await;
+                });
+                self.register_listener_handle(client_addr, handle).await;
+            }
+            installed += 1;
+        }
+        installed
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Linux recvmmsg batch state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum packets to drain in one `recvmmsg` syscall (Linux only).
+#[cfg(target_os = "linux")]
+const BATCH: usize = 32;
+
+/// Per-slot receive-buffer size.
+#[cfg(target_os = "linux")]
+const BUF_SIZE: usize = 2048;
+
+/// Heap-allocated kernel-facing state for one `recvmmsg` call.
+///
+/// `bufs`, raw receive buffers (32 × 2048 B = 64 KiB, on the task heap).
+/// `msgs`, `mmsghdr` array handed to the kernel.
+/// `saddrs`, `sockaddr_in` source-address slots, one per message.
+///
+/// `iovec` entries are rebuilt inside [`BatchState::do_recv`] on every call so
+/// the struct is not self-referential and does not require `Pin`.
+#[cfg(target_os = "linux")]
+struct BatchState {
+    bufs: [[u8; BUF_SIZE]; BATCH],
+    msgs: [libc::mmsghdr; BATCH],
+    saddrs: [libc::sockaddr_in; BATCH],
+}
+
+// SAFETY: `BatchState` is only ever accessed from one Tokio task at a time.
+// The raw pointer fields inside `libc::mmsghdr` are implementation details of
+// the recvmmsg call; they are re-initialised on every `do_recv` invocation and
+// are never observed across an async suspension point.
+#[cfg(target_os = "linux")]
+unsafe impl Send for BatchState {}
+
+#[cfg(target_os = "linux")]
+impl BatchState {
+    fn new() -> Self {
+        // SAFETY: zero-initialising C POD structs is always valid.
+        unsafe {
+            Self {
+                bufs: [[0u8; BUF_SIZE]; BATCH],
+                msgs: std::mem::zeroed(),
+                saddrs: std::mem::zeroed(),
+            }
+        }
+    }
+
+    /// Non-blocking `recvmmsg` call.
+    ///
+    /// Rebuilds iovecs on the stack before every call so the struct is not
+    /// self-referential.  Returns `Ok(n)` where `n >= 1`, or
+    /// `Err(WouldBlock)` when the socket has no pending data.
+    fn do_recv(&mut self, fd: libc::c_int) -> std::io::Result<usize> {
+        // Build iovecs on the stack.  They only need to live during this call.
+        let mut iovecs: [libc::iovec; BATCH] =
+            // SAFETY: zero-init is valid for iovec.
+            unsafe { std::mem::zeroed() };
+
+        // iovecs[i] and saddrs[i] live for the full duration of this function
+        // (and therefore across the recvmmsg call below).
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..BATCH {
+            iovecs[i].iov_base = self.bufs[i].as_mut_ptr() as *mut libc::c_void;
+            iovecs[i].iov_len = BUF_SIZE;
+
+            let hdr = &mut self.msgs[i].msg_hdr;
+            hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+            hdr.msg_iovlen = 1;
+            hdr.msg_name = &mut self.saddrs[i] as *mut libc::sockaddr_in as *mut libc::c_void;
+            hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            hdr.msg_control = std::ptr::null_mut();
+            hdr.msg_controllen = 0;
+            hdr.msg_flags = 0;
+
+            self.msgs[i].msg_len = 0;
+        }
+
+        // SAFETY: `fd` is valid (live UdpSocket), arrays fully initialised above.
+        let n = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.msgs.as_mut_ptr(),
+                BATCH as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if n < 0 {
+            // Includes EAGAIN → mapped to WouldBlock by the OS abstraction layer.
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+}
+
+/// Wait for `sock` to become readable, then drain up to `BATCH` datagrams in
+/// one `recvmmsg` syscall.
+///
+/// Uses `try_io` to properly arm/disarm Tokio's epoll interest:
+/// - On success the readiness flag stays set (there may be more data).
+/// - On `WouldBlock` the flag is cleared so `readable()` actually waits.
+#[cfg(target_os = "linux")]
+async fn recv_batch_async(sock: &UdpSocket, batch: &mut BatchState) -> std::io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
+    let fd = sock.as_raw_fd();
+    loop {
+        // Block until epoll says data is available.
+        sock.readable().await?;
+        // try_io is synchronous, no Send requirement on the closure.
+        match sock.try_io(tokio::io::Interest::READABLE, || batch.do_recv(fd)) {
+            Ok(n) if n > 0 => return Ok(n),
+            Ok(_) => continue, // shouldn't happen, re-arm just in case
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // try_io already cleared the readiness bit; loop to readable().
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Per-packet inbound processing (shared between all platforms)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Process a single received inbound packet.
+///
+/// Contains the full hot-path per-packet logic: rate-limit, header decode,
+/// auth, keepalive/FIN handling, abuse check, FEC, session management, and
+/// game-server forwarding.  Extracted so it can be called from both the
+/// Linux batched receive loop and the non-Linux single-recv loop.
+#[allow(clippy::too_many_arguments)]
+async fn process_inbound_packet(
+    buf: &[u8],
+    client_addr: SocketAddrV4,
+    sender: &ClientSender,
+    engine: &Arc<RelayEngine>,
+    rate_limiter: &Arc<tokio::sync::Mutex<RateLimiter>>,
+    authenticator: &Arc<RwLock<Authenticator>>,
+    abuse_detector: &Arc<tokio::sync::Mutex<AbuseDetector>>,
+    metrics: &Arc<ProxyMetrics>,
+) -> bool {
+    let len = buf.len();
+
+    // ── Rate limit check ────────────────────────────────────────
+    {
+        let mut rl = rate_limiter.lock().await;
+        match rl.check(client_addr, len as u64) {
+            RateLimitResult::Allowed => {}
+            RateLimitResult::PacketRateExceeded => {
+                trace!(client = %client_addr, "Rate limited (PPS)");
+                metrics.record_drop(DropReason::RateLimit);
+                return false;
+            }
+            RateLimitResult::BandwidthExceeded => {
+                trace!(client = %client_addr, "Rate limited (BPS)");
+                metrics.record_drop(DropReason::RateLimit);
+                return false;
+            }
+            RateLimitResult::IpPacketRateExceeded => {
+                trace!(client = %client_addr, "Rate limited (per-IP PPS)");
+                metrics.record_drop(DropReason::RateLimit);
+                metrics.record_rate_limit_ip();
+                return false;
+            }
+            RateLimitResult::IpBandwidthExceeded => {
+                trace!(client = %client_addr, "Rate limited (per-IP BPS)");
+                metrics.record_drop(DropReason::RateLimit);
+                metrics.record_rate_limit_ip();
+                return false;
+            }
+            RateLimitResult::IpTableFull => {
+                trace!(client = %client_addr, "Rate limit table full");
+                metrics.record_drop(DropReason::RateLimit);
+                metrics.record_rate_limit_overflow();
+                return false;
+            }
+            RateLimitResult::FlowTableFull => {
+                trace!(client = %client_addr, "Rate limit flow table full");
+                metrics.record_drop(DropReason::RateLimit);
+                metrics.record_rate_limit_overflow();
+                return false;
+            }
+        }
+    }
+
+    // ── Decode tunnel header ────────────────────────────────────
+    let (header, payload) = match TunnelHeader::decode_with_payload(buf) {
+        Ok(result) => result,
+        Err(e) => {
+            debug!(client = %client_addr, error = %e, "Invalid tunnel packet");
+            metrics.record_drop(DropReason::Malformed);
+            return false;
+        }
+    };
+
+    // ── Control packets ─────────────────────────────────────────
+    // Keepalives are answered without auth: they are "are you alive" pings the
+    // client uses to probe latency before registering, and they reveal nothing
+    // the public health endpoint does not already expose. (No amplification
+    // risk, the response is the same size as the request.)
+    if header.is_keepalive() {
+        trace!(client = %client_addr, seq = header.sequence, "Keepalive received");
+        let response = TunnelHeader::keepalive(header.sequence, now_us())
+            .with_session_token(header.session_token);
+        let response_bytes = response.encode_to_array();
+        let _ = sender.send(&response_bytes).await;
+        return false;
+    }
+
+    // ── Security: Authentication check ──────────────────────────
+    {
+        let auth = authenticator.read().await;
+        if !auth.validate(
+            *client_addr.ip(),
+            client_addr.port(),
+            header.session_token,
+            Instant::now(),
+        ) {
+            debug!(
+                client = %client_addr,
+                token = header.session_token,
+                "Unauthorized: invalid principal, port, or session token"
+            );
+            metrics.record_drop(DropReason::Auth);
+            return false;
+        }
+    }
+
+    if header.is_fin() {
+        info!(client = %client_addr, "Client sent FIN, closing session");
+        let sessions_lock = engine.sessions();
+        let mut sessions = sessions_lock.write().await;
+        if let Some(session) = sessions.remove(&client_addr) {
+            session.cancel.cancel();
+        }
+        return true;
+    }
+
+    // Get the original destination (game server) from the header
+    let game_server = header.orig_dst_addr();
+    let is_fec = header.has_fec();
+
+    // ── Security: Abuse detection (includes destination validation) ──
+    {
+        let mut abuse = abuse_detector.lock().await;
+        match abuse.record_inbound(*client_addr.ip(), game_server, len as u64) {
+            AbuseCheckResult::Allowed => {}
+            AbuseCheckResult::PrivateDestination => {
+                debug!(
+                    client = %client_addr,
+                    dest = %game_server,
+                    "Blocked: private/internal destination"
+                );
+                metrics.record_drop(DropReason::Abuse);
+                return false;
+            }
+            AbuseCheckResult::DestinationNotAllowed => {
+                debug!(
+                    client = %client_addr,
+                    dest = %game_server,
+                    "Blocked: destination not in allowlist"
+                );
+                metrics.record_drop(DropReason::Abuse);
+                return false;
+            }
+            AbuseCheckResult::Banned => {
+                trace!(client = %client_addr, "Blocked: client is banned");
+                metrics.record_drop(DropReason::Abuse);
+                return false;
+            }
+            AbuseCheckResult::ReflectionDetected => {
+                warn!(client = %client_addr, "Blocked: reflection attack detected");
+                metrics.record_drop(DropReason::Abuse);
+                return false;
+            }
+            AbuseCheckResult::AmplificationDetected => {
+                warn!(client = %client_addr, "Blocked: amplification detected");
+                metrics.record_drop(DropReason::Abuse);
+                return false;
+            }
+        }
+    }
+
+    // ── FEC: Parse FEC header if version 2 ──────────────────────
+    let (fec_hdr, game_payload) = if is_fec {
+        if payload.len() < FEC_HEADER_SIZE {
+            debug!(client = %client_addr, "FEC packet too short");
+            metrics.record_drop(DropReason::FecMalformed);
+            return false;
+        }
+        let mut fec_slice: &[u8] = &payload[..FEC_HEADER_SIZE];
+        match FecHeader::decode(&mut fec_slice) {
+            Some(fh) => (Some(fh), &payload[FEC_HEADER_SIZE..]),
+            None => {
+                debug!(client = %client_addr, "Invalid FEC header");
+                metrics.record_drop(DropReason::FecMalformed);
+                return false;
+            }
+        }
+    } else {
+        (None, payload)
+    };
+
+    // Determine FEC k_size for session creation
+    let fec_k = fec_hdr.as_ref().map(|h| h.k_size).unwrap_or(4);
+
+    // ── TCP-tunnelled connection (protocol v5) ───────────────────
+    //
+    // The keepalive → auth → FIN → abuse checks above already ran on the shared
+    // tunnel header, so v5 inherits auth, rate limiting, and destination
+    // validation for free. FEC is decoded identically before this branch; the
+    // per-connection FecDecoder converges a block's parity and data packets.
+    if header.has_tcp() {
+        process_tcp_packet(
+            &header,
+            fec_hdr.as_ref(),
+            game_payload,
+            client_addr,
+            sender,
+            engine,
+            metrics,
+        )
+        .await;
+        return false;
+    }
+
+    // ── Session: get or create ───────────────────────────────────
+    let (session, is_new) = match engine
+        .get_or_create_session(client_addr, game_server, is_fec, fec_k, sender.clone())
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(exceeded) = e.downcast_ref::<BudgetExceeded>() {
+                warn!(
+                    client = %client_addr,
+                    limit_bytes = exceeded.limit,
+                    used_bytes = exceeded.used,
+                    used_pct = exceeded.pct,
+                    "Egress budget reached: refusing new session (existing sessions continue)"
+                );
+                metrics.record_drop(DropReason::EgressBudget);
+            } else {
+                warn!(client = %client_addr, error = %e, "Failed to create session");
+                metrics.record_drop(DropReason::SessionSetup);
+            }
+            return false;
+        }
+    };
+
+    // Immediately spawn the response listener for a brand-new session. The
+    // claim is idempotent, so if the periodic manager won the race this site
+    // must not spawn a second listener. We park our handle in the engine
+    // registry (rather than dropping it) so the manager can abort it when the
+    // session is later removed.
+    if is_new {
+        metrics.record_session_created();
+        if session.claim_response_listener() {
+            let session_clone = Arc::clone(&session);
+            let metrics_clone = Arc::clone(metrics);
+            let handle = tokio::spawn(async move {
+                run_session_response_listener(session_clone, metrics_clone).await;
+            });
+            engine.register_listener_handle(client_addr, handle).await;
+            info!(client = %client_addr, fec = is_fec, "Response listener spawned immediately");
+        }
+    }
+
+    // ── Handle FEC parity packets ───────────────────────────────
+    if let Some(ref fh) = fec_hdr {
+        if fh.is_parity() {
+            // Parity packet: do NOT forward to game server.
+            // Feed into FEC decoder for potential recovery.
+            metrics.record_fec_parity();
+            let parity_data = bytes::Bytes::copy_from_slice(game_payload);
+            let mut decoder = session.fec_decoder.lock().await;
+            if let Some((_idx, recovered)) = decoder.receive_parity(fh, parity_data) {
+                // Recovered a lost packet, forward to game server
+                metrics.record_fec_recovery();
+                info!(
+                    client = %client_addr,
+                    block = fh.block_id,
+                    recovered_len = recovered.len(),
+                    "🔧 FEC recovered lost packet on proxy"
+                );
+                session.pending_forward_us.store(
+                    session.started_at.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
+                match session
+                    .outbound_socket
+                    .send_to(&recovered, game_server)
+                    .await
+                {
+                    Ok(sent) => {
+                        metrics.record_relay(sent as u64);
+                    }
+                    Err(e) => {
+                        session.pending_forward_us.store(0, Ordering::Relaxed);
+                        metrics.record_drop(DropReason::RelaySendError);
+                        debug!(client = %client_addr, error = %e, "Failed to forward recovered packet");
+                    }
+                }
+            }
+            // Periodic GC
+            decoder.gc();
+            return false; // Don't forward parity to game server
+        } else {
+            // Data packet with FEC: track in decoder, then forward game_payload
+            metrics.record_fec_data();
+            let data_bytes = bytes::Bytes::copy_from_slice(game_payload);
+            let mut decoder = session.fec_decoder.lock().await;
+            decoder.receive_data(fh, data_bytes);
+        }
+    }
+
+    // ── Forward the raw game payload to the game server ─────────
+    // Stamp the monotonic send time before the await so the response listener
+    // can measure the upstream lag when the matching response arrives.
+    session.pending_forward_us.store(
+        session.started_at.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
+    match session
+        .outbound_socket
+        .send_to(game_payload, game_server)
+        .await
+    {
+        Ok(sent) => {
+            metrics.record_relay(sent as u64);
+            trace!(
+                client = %client_addr,
+                game_server = %game_server,
+                seq = header.sequence,
+                payload_len = game_payload.len(),
+                fec = is_fec,
+                "Forwarded to game server"
+            );
+
+            session
+                .last_client_seq
+                .store(header.sequence, Ordering::Relaxed);
+            session.touch();
+
+            let mut abuse = abuse_detector.lock().await;
+            abuse.record_outbound(*client_addr.ip(), sent as u64);
+        }
+        Err(e) => {
+            session.pending_forward_us.store(0, Ordering::Relaxed);
+            debug!(
+                client = %client_addr,
+                game_server = %game_server,
+                error = %e,
+                "Failed to forward to game server"
+            );
+            metrics.record_drop(DropReason::RelaySendError);
+        }
+    }
+
+    false
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TCP-tunnelled connection handling (protocol v5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a v5 data response for the client: `[TunnelHeader][FecHeader]
+/// [TcpExtHeader][payload]` with the source/destination swapped back to the
+/// client, the connection's FEC header, and the reliability layer's seq/ack.
+fn build_tcp_response_packet(
+    client_header: &TunnelHeader,
+    seq: u16,
+    fec_hdr: &FecHeader,
+    tcp_seq: u32,
+    tcp_ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> bytes::BytesMut {
+    let response_header = client_header
+        .make_response(seq, now_us())
+        .with_session_token(client_header.session_token);
+    let tcp_ext = TcpExtHeader {
+        tcp_seq,
+        tcp_ack,
+        flags,
+        window: 0,
+        reserved: [0, 0],
+    };
+    build_tcp_packet(&response_header, fec_hdr, &tcp_ext, payload)
+}
+
+/// Build a v5 RST packet (zero payload, RST flag) to tear the client's
+/// terminator down.
+fn build_tcp_rst_packet(client_header: &TunnelHeader, fec_k: u8) -> bytes::BytesMut {
+    let response_header = client_header.make_response(0, now_us());
+    let fec_hdr = FecHeader::data(0, 0, fec_k.max(2));
+    let tcp_ext = TcpExtHeader {
+        tcp_seq: 0,
+        tcp_ack: 0,
+        flags: tcp_flags::RST,
+        window: 0,
+        reserved: [0, 0],
+    };
+    build_tcp_packet(&response_header, &fec_hdr, &tcp_ext, &[])
+}
+
+/// Route one v5 packet (already past auth/abuse and FEC framing) to its
+/// per-5-tuple connection. This is the relay-side connector: on SYN it dials
+/// the real server, on data it splices bytes upstream, on FIN it shuts the
+/// write half, and on RST it tears the connection down.
+#[allow(clippy::too_many_arguments)]
+async fn process_tcp_packet(
+    client_header: &TunnelHeader,
+    fec_hdr: Option<&FecHeader>,
+    game_payload: &[u8],
+    client_addr: SocketAddrV4,
+    sender: &ClientSender,
+    engine: &Arc<RelayEngine>,
+    metrics: &Arc<ProxyMetrics>,
+) {
+    let tuple = Tcp5Tuple {
+        src_ip: client_header.orig_src_ip,
+        src_port: client_header.orig_src_port,
+        dst_ip: client_header.orig_dst_ip,
+        dst_port: client_header.orig_dst_port,
+    };
+
+    let fec_k = fec_hdr.map(|h| h.k_size).unwrap_or(4).max(2);
+
+    // SYN opens the connection; anything else needs an existing entry.
+    let is_syn = decode_tcp_payload(game_payload)
+        .map(|(ext, _)| ext.flags & tcp_flags::SYN != 0)
+        .unwrap_or(false);
+    let conn = if is_syn {
+        match engine.get_or_create_tcp_connection(tuple, fec_k).await {
+            Ok((conn, is_new)) => {
+                if is_new {
+                    metrics.record_session_created();
+                    let engine = Arc::clone(engine);
+                    let metrics = Arc::clone(metrics);
+                    let sender = sender.clone();
+                    let header = client_header.clone();
+                    let conn_clone = Arc::clone(&conn);
+                    tokio::spawn(async move {
+                        run_tcp_connection(
+                            conn_clone,
+                            client_addr,
+                            sender,
+                            header,
+                            engine,
+                            metrics,
+                        )
+                        .await;
+                    });
+                    info!(
+                        src = %tuple.src_ip,
+                        src_port = tuple.src_port,
+                        dst = %tuple.dst_ip,
+                        dst_port = tuple.dst_port,
+                        "TCP connection created"
+                    );
+                }
+                conn
+            }
+            Err(e) => {
+                if let Some(exceeded) = e.downcast_ref::<BudgetExceeded>() {
+                    warn!(
+                        client = %client_addr,
+                        limit_bytes = exceeded.limit,
+                        used_bytes = exceeded.used,
+                        "Egress budget reached: refusing TCP connection"
+                    );
+                    metrics.record_drop(DropReason::EgressBudget);
+                } else {
+                    warn!(client = %client_addr, error = %e, "Failed to create TCP connection");
+                    metrics.record_drop(DropReason::SessionSetup);
+                }
+                let _ = sender
+                    .send(&build_tcp_rst_packet(client_header, fec_k))
+                    .await;
+                return;
+            }
+        }
+    } else {
+        let Some(conn) = engine.tcp_table().read().await.get(&tuple).cloned() else {
+            trace!(
+                client = %client_addr,
+                "TCP packet for unknown 5-tuple dropped"
+            );
+            metrics.record_drop(DropReason::Malformed);
+            return;
+        };
+        conn
+    };
+
+    // ── FEC decode, per connection ───────────────────────────────
+    let decoded = {
+        let mut decoder = conn.fec_decoder.lock().await;
+        match fec_hdr {
+            Some(fh) if fh.is_parity() => {
+                metrics.record_fec_parity();
+                decoder
+                    .receive_parity(fh, bytes::Bytes::copy_from_slice(game_payload))
+                    .map(|(_, recovered)| recovered)
+            }
+            Some(fh) => {
+                metrics.record_fec_data();
+                let data = bytes::Bytes::copy_from_slice(game_payload);
+                Some(decoder.receive_data(fh, data))
+            }
+            None => Some(bytes::Bytes::copy_from_slice(game_payload)),
+        }
+    };
+
+    let Some(data) = decoded else {
+        // Parity that recovered nothing: nothing to forward.
+        return;
+    };
+
+    // ── Parse the TCP extension header and route by flags ────────
+    let Some((tcp_ext, stream_payload)) = decode_tcp_payload(&data) else {
+        debug!(client = %client_addr, "Invalid TCP extension header");
+        metrics.record_drop(DropReason::FecMalformed);
+        return;
+    };
+
+    conn.last_client_seq
+        .store(client_header.sequence, Ordering::Relaxed);
+    conn.touch();
+
+    if tcp_ext.flags & tcp_flags::RST != 0 {
+        info!(client = %client_addr, "TCP RST, tearing down connection");
+        engine.remove_tcp_connection(&tuple).await;
+        return;
+    }
+
+    if tcp_ext.flags & tcp_flags::FIN != 0 {
+        if let Some(tx) = conn.take_conn_tx() {
+            let _ = tx.send(TcpCmd::Fin).await;
+        }
+    }
+
+    if !stream_payload.is_empty() {
+        let ordered = conn
+            .reliable
+            .lock()
+            .await
+            .receiver
+            .on_segment(tcp_ext.tcp_seq, stream_payload);
+        if let Some(tx) = conn.take_conn_tx() {
+            for chunk in ordered {
+                if tx.send(TcpCmd::Data(chunk)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The per-connection task: dials the real server, splices buffered client
+/// payloads into it, reads server bytes back through the reliability encoder
+/// and FEC, and tears down. This is the proxy-side connector.
+#[allow(clippy::too_many_arguments)]
+async fn run_tcp_connection(
+    conn: Arc<TcpConnState>,
+    client_addr: SocketAddrV4,
+    sender: ClientSender,
+    client_header: TunnelHeader,
+    engine: Arc<RelayEngine>,
+    metrics: Arc<ProxyMetrics>,
+) {
+    let tuple = conn.tuple;
+    let dst = SocketAddrV4::new(tuple.dst_ip, tuple.dst_port);
+    let upstream = match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(dst)).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            warn!(client = %client_addr, dst = %dst, error = %e, "TCP dial failed");
+            let _ = sender
+                .send(&build_tcp_rst_packet(&client_header, conn.fec_k))
+                .await;
+            engine.remove_tcp_connection(&tuple).await;
+            return;
+        }
+        Err(_) => {
+            warn!(client = %client_addr, dst = %dst, "TCP dial timed out");
+            let _ = sender
+                .send(&build_tcp_rst_packet(&client_header, conn.fec_k))
+                .await;
+            engine.remove_tcp_connection(&tuple).await;
+            return;
+        }
+    };
+    if let Err(e) = upstream.set_nodelay(true) {
+        debug!(client = %client_addr, error = %e, "Failed to set TCP_NODELAY");
+    }
+    let (mut read_half, mut write_half): (OwnedReadHalf, OwnedWriteHalf) = upstream.into_split();
+    conn.established.store(true, Ordering::Release);
+
+    let mut rx = conn
+        .take_conn_rx()
+        .expect("connection task owns the command receiver");
+    let mut fec_encoder = FecEncoder::new(conn.fec_k);
+    let mut retransmit = tokio::time::interval(Duration::from_millis(50));
+    let mut buf = vec![0u8; 2048];
+    let mut parity_buf = [0u8; FEC_MAX_PAYLOAD + 2];
+    let mut response_seq = 0u16;
+
+    loop {
+        tokio::select! {
+            _ = conn.cancel.cancelled() => break,
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(TcpCmd::Data(payload)) => {
+                        if write_half.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                        conn.touch();
+                    }
+                    Some(TcpCmd::Fin) => {
+                        let _ = write_half.shutdown().await;
+                        // Keep reading until the server closes, then exit.
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            res = read_half.read(&mut buf) => {
+                match res {
+                    Ok(n) if n > 0 => {
+                        conn.touch();
+                        let payload = &buf[..n];
+                        let (tcp_seq, tcp_ack) = {
+                            let mut reliable = conn.reliable.lock().await;
+                            let Some(tcp_seq) = reliable.sender.send(payload) else {
+                                continue;
+                            };
+                            (tcp_seq, reliable.receiver.ack())
+                        };
+                        let seq = conn.last_client_seq.load(Ordering::Relaxed);
+                        let block_id = fec_encoder.block_id();
+                        let index = fec_encoder.current_index();
+                        let fec_hdr = FecHeader::data(block_id, index, conn.fec_k);
+                        let packet = build_tcp_response_packet(
+                            &client_header,
+                            seq,
+                            &fec_hdr,
+                            tcp_seq,
+                            tcp_ack,
+                            tcp_flags::ACK | tcp_flags::PSH,
+                            payload,
+                        );
+                        let _ = sender.send(&packet).await;
+                        metrics.record_relay(packet.len() as u64);
+
+                        // FEC: parity emission rides on the same block as the
+                        // data packets, matching the client leg's K.
+                        let block_complete = fec_encoder.add_packet_inplace(payload);
+                        if block_complete {
+                            let parity_len = fec_encoder.emit_parity_to(&mut parity_buf);
+                            let parity_header = client_header
+                                .make_response(response_seq, now_us())
+                                .with_session_token(client_header.session_token);
+                            let parity_fec = FecHeader::parity(block_id, conn.fec_k);
+                            let parity_packet =
+                                build_fec_parity_packet(&parity_header, &parity_fec, &parity_buf[..parity_len]);
+                            let _ = sender.send(&parity_packet).await;
+                            metrics.record_relay(parity_packet.len() as u64);
+                            fec_encoder.next_block();
+                        }
+                        response_seq = response_seq.wrapping_add(1);
+                    }
+                    Ok(_) => break, // EOF: server closed
+                    Err(_) => break,
+                }
+            }
+            _ = retransmit.tick() => {
+                let (seq, tcp_ack, payload) = {
+                    let mut reliable = conn.reliable.lock().await;
+                    let Some((seq, payload)) = reliable.sender.poll_retransmit(Instant::now()) else {
+                        continue;
+                    };
+                    (seq, reliable.receiver.ack(), payload)
+                };
+                let client_seq = conn.last_client_seq.load(Ordering::Relaxed);
+                let fec_hdr = FecHeader::data(
+                    fec_encoder.block_id(),
+                    fec_encoder.current_index(),
+                    conn.fec_k,
+                );
+                let packet = build_tcp_response_packet(
+                    &client_header,
+                    client_seq,
+                    &fec_hdr,
+                    seq,
+                    tcp_ack,
+                    tcp_flags::ACK | tcp_flags::PSH,
+                    &payload,
+                );
+                let _ = sender.send(&packet).await;
+                metrics.record_relay(packet.len() as u64);
+            }
+        }
+    }
+
+    conn.cancel.cancel();
+    engine.remove_tcp_connection(&tuple).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Public entry point, dispatches to the platform-appropriate loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the main relay loop on the data plane socket.
+///
+/// **Linux**: drains up to `BATCH` (32) packets per `recvmmsg` syscall.
+/// **Other platforms**: falls back to one `recv_from` per packet.
+///
+/// This is the hot path, every game packet goes through here.
+#[cfg(target_os = "linux")]
+pub async fn run_relay_inbound(
+    data_socket: Arc<UdpSocket>,
+    engine: Arc<RelayEngine>,
+    rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    authenticator: Arc<RwLock<Authenticator>>,
+    abuse_detector: Arc<tokio::sync::Mutex<AbuseDetector>>,
+    metrics: Arc<ProxyMetrics>,
+) -> anyhow::Result<()> {
+    let mut batch = BatchState::new();
+    configure_data_socket(&data_socket, &metrics);
+    info!(
+        "Relay inbound loop started (Linux recvmmsg, batch={})",
+        BATCH
+    );
+
+    loop {
+        let n = match recv_batch_async(&data_socket, &mut batch).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Data socket recvmmsg error: {}", e);
+                continue;
+            }
+        };
+
+        // Record batch size for observability (avg batch size = received/batches).
+        metrics.record_inbound_batch(n);
+
+        for i in 0..n {
+            let pkt_len = batch.msgs[i].msg_len as usize;
+            let sin = &batch.saddrs[i];
+
+            // Our socket is AF_INET only; this check is defensive.
+            if sin.sin_family as libc::c_int != libc::AF_INET {
+                trace!("Ignoring non-AF_INET packet in batch slot {}", i);
+                continue;
+            }
+
+            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
+            let client_addr = SocketAddrV4::new(ip, port);
+
+            process_inbound_packet(
+                &batch.bufs[i][..pkt_len],
+                client_addr,
+                &ClientSender::Udp {
+                    socket: Arc::clone(&data_socket),
+                    addr: client_addr,
+                },
+                &engine,
+                &rate_limiter,
+                &authenticator,
+                &abuse_detector,
+                &metrics,
+            )
+            .await;
+        }
+    }
+}
+
+/// Non-Linux fallback: one `recv_from` per packet.
+#[cfg(not(target_os = "linux"))]
+pub async fn run_relay_inbound(
+    data_socket: Arc<UdpSocket>,
+    engine: Arc<RelayEngine>,
+    rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    authenticator: Arc<RwLock<Authenticator>>,
+    abuse_detector: Arc<tokio::sync::Mutex<AbuseDetector>>,
+    metrics: Arc<ProxyMetrics>,
+) -> anyhow::Result<()> {
+    let mut buf = vec![0u8; 2048];
+    configure_data_socket(&data_socket, &metrics);
+    info!("Relay inbound loop started");
+
+    loop {
+        let (len, addr) = match data_socket.recv_from(&mut buf).await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Data socket recv error: {}", e);
+                continue;
+            }
+        };
+
+        // We only support IPv4
+        let client_addr = match addr {
+            std::net::SocketAddr::V4(v4) => v4,
+            std::net::SocketAddr::V6(_) => {
+                trace!("Ignoring IPv6 packet");
+                continue;
+            }
+        };
+
+        // Record 1 recv_from = 1 batch of 1 packet (for metric consistency).
+        metrics.record_inbound_batch(1);
+
+        process_inbound_packet(
+            &buf[..len],
+            client_addr,
+            &ClientSender::Udp {
+                socket: Arc::clone(&data_socket),
+                addr: client_addr,
+            },
+            &engine,
+            &rate_limiter,
+            &authenticator,
+            &abuse_detector,
+            &metrics,
+        )
+        .await;
+    }
+}
+
+/// Run the response listener for a single client session.
+///
+/// Listens on the session's outbound socket for responses from the game
+/// server, wraps them in a LightSpeed header, and sends them back to
+/// the client via the data plane socket.
+///
+/// If the client uses FEC, responses are also FEC-encoded.
+pub async fn run_session_response_listener(
+    session: Arc<ClientSession>,
+    metrics: Arc<ProxyMetrics>,
+) {
+    let mut buf = vec![0u8; 2048];
+
+    // Single stack-allocated output buffer reused for every outbound packet.
+    // Lives in the task state (heap-allocated by Tokio), zero per-packet alloc.
+    // Size: TunnelHeader(20) + FecHeader(4) + max recv buf(2048) = MAX_RELAY_PKT.
+    let mut pkt_buf = [0u8; MAX_RELAY_PKT];
+
+    // Create FEC encoder if client supports FEC
+    let mut fec_encoder = if session.fec_enabled {
+        Some(FecEncoder::new(session.fec_k))
+    } else {
+        None
+    };
+
+    loop {
+        // Receive response from game server, bailing early if the session is
+        // cancelled (TCP connection dropped or FIN received).
+        let len = tokio::select! {
+            _ = session.cancel.cancelled() => break,
+            res = session.outbound_socket.recv_from(&mut buf) => {
+                match res {
+                    Ok((len, src_addr)) => {
+                        // Drop datagrams from any host other than the game
+                        // server (off-path injection guard).
+                        if src_addr.ip() != std::net::IpAddr::from(*session.game_server.ip()) {
+                            continue;
+                        }
+                        session.touch();
+
+                        // Record proxy-observed upstream lag exactly once per
+                        // forward: `swap(0)` claims the pending marker so later
+                        // unprompted server ticks cannot produce samples.
+                        let now = session.started_at.elapsed().as_micros() as u64;
+                        let marker = session.pending_forward_us.swap(0, Ordering::Relaxed);
+                        if marker != 0 {
+                            match upstream_lag(now, marker) {
+                                Some(lag) => metrics.record_latency(lag),
+                                None => metrics.record_latency_discarded(),
+                            }
+                        }
+                        len
+                    }
+                    Err(e) => {
+                        debug!(
+                            client = %session.client_addr,
+                            error = %e,
+                            "Outbound socket recv error"
+                        );
+                        break;
+                    }
+                }
+            }
+        };
+
+        let payload = &buf[..len];
+        let seq = session.response_seq.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(ref mut encoder) = fec_encoder {
+            // ── FEC mode: zero-alloc data + parity path (WF-008 Item L) ──────
+            //
+            // Three-phase zero-alloc protocol:
+            //   1. add_packet_inplace , XOR into parity accumulator (no alloc)
+            //   2. emit_parity_to     , write parity directly into pkt_buf (no alloc)
+            //   3. next_block         , reset accumulator for the next block
+            //
+            // This eliminates both the per-data-packet `Bytes::copy_from_slice`
+            // that `add_packet` used to perform and the `BytesMut::with_capacity`
+            // that `emit_parity` allocated once per completed block.
+            let block_id = encoder.block_id();
+            let index = encoder.current_index();
+
+            // Build: [TunnelHeader v2][FecHeader data][game_response]
+            // The sequence field echoes the client's last packet sequence (not a
+            // proxy-local counter) so the client can deduplicate the same game
+            // response arriving via multiple relays in multipath mode.
+            let response_header = TunnelHeader::new_fec(
+                session.last_client_seq.load(Ordering::Relaxed),
+                now_us(),
+                session.game_server,
+                session.client_addr,
+            );
+            let fec_hdr = FecHeader::data(block_id, index, session.fec_k);
+
+            // Zero-alloc: write FEC data packet directly into the pre-allocated task buffer.
+            let parity_offset = HEADER_SIZE + FEC_HEADER_SIZE;
+            let data_end = parity_offset + payload.len();
+            pkt_buf[..HEADER_SIZE].copy_from_slice(&response_header.encode_to_array());
+            pkt_buf[HEADER_SIZE..parity_offset].copy_from_slice(&fec_hdr.encode_to_array());
+            pkt_buf[parity_offset..data_end].copy_from_slice(payload);
+
+            // Phase 1: XOR payload into parity accumulator, no allocation.
+            let block_complete = encoder.add_packet_inplace(payload);
+
+            // Send data packet to client (zero heap allocation)
+            match session.sender.send(&pkt_buf[..data_end]).await {
+                Ok(sent) => {
+                    metrics.record_relay(sent as u64);
+                    trace!(
+                        client = %session.client_addr,
+                        seq = seq,
+                        fec_block = block_id,
+                        fec_idx = index,
+                        "Sent FEC response to client"
+                    );
+                }
+                Err(e) => {
+                    if session.sender.is_tcp() {
+                        break;
+                    }
+                    debug!(
+                        client = %session.client_addr,
+                        error = %e,
+                        "Failed to send FEC response to client"
+                    );
+                }
+            }
+
+            // Phase 2 + 3: if block complete, emit parity directly into pkt_buf
+            // and send, still zero heap allocation.
+            if block_complete {
+                let parity_seq = session.response_seq.fetch_add(1, Ordering::Relaxed);
+                let parity_header = TunnelHeader::new_fec(
+                    parity_seq,
+                    now_us(),
+                    session.game_server,
+                    session.client_addr,
+                );
+                let parity_fec = FecHeader::parity(block_id, session.fec_k);
+
+                // Phase 2: write parity content directly into the pre-allocated buffer.
+                // pkt_buf[parity_offset..] is free, the data packet was already sent.
+                let parity_len = encoder.emit_parity_to(&mut pkt_buf[parity_offset..]);
+                let par_end = parity_offset + parity_len;
+
+                // Write parity packet headers (overwrites the earlier data headers,
+                // safe because the data packet was sent above).
+                pkt_buf[..HEADER_SIZE].copy_from_slice(&parity_header.encode_to_array());
+                pkt_buf[HEADER_SIZE..parity_offset].copy_from_slice(&parity_fec.encode_to_array());
+
+                match session.sender.send(&pkt_buf[..par_end]).await {
+                    Ok(sent) => {
+                        metrics.record_relay(sent as u64);
+                        trace!(
+                            client = %session.client_addr,
+                            seq = parity_seq,
+                            fec_block = block_id,
+                            "Sent parity to client (zero-alloc)"
+                        );
+                    }
+                    Err(e) => {
+                        if session.sender.is_tcp() {
+                            break;
+                        }
+                        debug!(
+                            client = %session.client_addr,
+                            error = %e,
+                            "Failed to send parity to client"
+                        );
+                    }
+                }
+
+                // Phase 3: advance to the next block.
+                encoder.next_block();
+            }
+        } else {
+            // ── Non-FEC mode: zero-alloc response ────────────────────
+            let response_header = TunnelHeader::new(
+                session.last_client_seq.load(Ordering::Relaxed),
+                now_us(),
+                session.game_server,
+                session.client_addr,
+            );
+
+            // Write header + payload directly into the pre-allocated task buffer.
+            pkt_buf[..HEADER_SIZE].copy_from_slice(&response_header.encode_to_array());
+            pkt_buf[HEADER_SIZE..HEADER_SIZE + payload.len()].copy_from_slice(payload);
+            let pkt_end = HEADER_SIZE + payload.len();
+
+            match session.sender.send(&pkt_buf[..pkt_end]).await {
+                Ok(sent) => {
+                    metrics.record_relay(sent as u64);
+                    trace!(
+                        client = %session.client_addr,
+                        seq = seq,
+                        payload_len = len,
+                        "Sent response to client"
+                    );
+                }
+                Err(e) => {
+                    if session.sender.is_tcp() {
+                        break;
+                    }
+                    debug!(
+                        client = %session.client_addr,
+                        error = %e,
+                        "Failed to send response to client"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Periodically clean up expired sessions, stale abuse data, and start
+/// response listeners for new sessions.
+pub async fn run_session_manager(
+    engine: Arc<RelayEngine>,
+    abuse_detector: Arc<tokio::sync::Mutex<AbuseDetector>>,
+    metrics: Arc<ProxyMetrics>,
+    rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    authenticator: Arc<RwLock<Authenticator>>,
+) {
+    let mut known_sessions: HashMap<SocketAddrV4, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+    loop {
+        interval.tick().await;
+
+        // Clean up expired sessions
+        let removed = engine.cleanup_expired().await;
+        if removed > 0 {
+            metrics.record_session_expired(removed as u64);
+            info!("Cleaned up {} expired sessions", removed);
+        }
+
+        // Clean up expired TCP-tunnelled connections (idle sweep).
+        let tcp_removed = engine.cleanup_expired_tcp().await;
+        if tcp_removed > 0 {
+            metrics.record_session_expired(tcp_removed as u64);
+            info!("Cleaned up {} expired TCP connections", tcp_removed);
+        }
+
+        // Publish the egress budget state and log any threshold crossing even
+        // when no session is being created.
+        engine.observe_budget(&metrics);
+
+        // Clean up abuse detector + rate limiter state. Both are keyed by
+        // client address and would otherwise grow unbounded from spoofed
+        // datagrams (65k source ports per IP).
+        {
+            let mut abuse = abuse_detector.lock().await;
+            abuse.cleanup();
+        }
+        rate_limiter.lock().await.cleanup();
+
+        // Drop auth entries past their TTL/grace deadline (see auth::sweep).
+        authenticator.write().await.sweep(Instant::now());
+
+        // Remove join handles for sessions that no longer exist
+        let sessions_lock = engine.sessions();
+        let active = sessions_lock.read().await;
+        known_sessions.retain(|addr, handle| {
+            if !active.contains_key(addr) {
+                handle.abort();
+                false
+            } else {
+                true
+            }
+        });
+
+        // Abort immediately-spawned listeners whose sessions are gone. Their
+        // handles are parked in the engine registry, not in `known_sessions`.
+        engine.reap_listener_handles(&active).await;
+
+        // Start response listeners for sessions no earlier site claimed. The
+        // idempotent claim means a session whose immediate listener already won
+        // is skipped here, so exactly one listener runs per session.
+        for (addr, session) in active.iter() {
+            if !known_sessions.contains_key(addr) && session.claim_response_listener() {
+                let session = Arc::clone(session);
+                let metrics = Arc::clone(&metrics);
+
+                let handle = tokio::spawn(async move {
+                    run_session_response_listener(session, metrics).await;
+                });
+
+                known_sessions.insert(*addr, handle);
+            }
+        }
+
+        let session_count = active.len();
+        drop(active);
+
+        if session_count > 0 {
+            debug!(
+                sessions = session_count,
+                listeners = known_sessions.len(),
+                "Session manager tick"
+            );
+        }
+    }
+}
+
+/// Run the TCP inbound listener for the client→proxy leg.
+///
+/// Accepts TCP connections on the data-plane port, reads length-prefixed
+/// frames, and feeds each frame through the exact same [`process_inbound_packet`]
+/// pipeline as UDP, rate limiting, auth, abuse detection, destination
+/// validation, and FEC all apply identically.  Responses are written back as
+/// framed packets via [`ClientSender::Tcp`].
+pub async fn run_tcp_inbound(
+    tcp_bind: SocketAddr,
+    engine: Arc<RelayEngine>,
+    rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    authenticator: Arc<RwLock<Authenticator>>,
+    abuse_detector: Arc<tokio::sync::Mutex<AbuseDetector>>,
+    metrics: Arc<ProxyMetrics>,
+    max_connections: usize,
+    read_timeout: Duration,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(tcp_bind).await?;
+    info!("TCP inbound listener bound to {}", listener.local_addr()?);
+
+    let semaphore = Arc::new(Semaphore::new(max_connections));
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("TCP accept error: {}", e);
+                continue;
+            }
+        };
+
+        // The data plane is IPv4-only.
+        let peer_v4 = match peer {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_) => {
+                trace!(peer = %peer, "Dropping IPv6 TCP client");
+                continue;
+            }
+        };
+
+        // Enforce the concurrent-connection cap.
+        let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                debug!(client = %peer_v4, "TCP connection limit reached, dropping");
+                continue;
+            }
+        };
+
+        let engine = Arc::clone(&engine);
+        let rate_limiter = Arc::clone(&rate_limiter);
+        let authenticator = Arc::clone(&authenticator);
+        let abuse_detector = Arc::clone(&abuse_detector);
+        let metrics = Arc::clone(&metrics);
+
+        tokio::spawn(async move {
+            // Hold the permit for the lifetime of the connection.
+            let _permit = permit;
+
+            if let Err(e) = stream.set_nodelay(true) {
+                warn!(client = %peer_v4, error = %e, "Failed to set TCP_NODELAY");
+            }
+
+            let (read, write) = stream.into_split();
+            let cancel = CancellationToken::new();
+            let sender = ClientSender::Tcp {
+                write: Arc::new(tokio::sync::Mutex::new(write)),
+                cancel: cancel.clone(),
+            };
+
+            let mut read = read;
+            let mut buf: Vec<u8> = Vec::with_capacity(MAX_FRAME_SIZE);
+
+            loop {
+                let frame =
+                    match tokio::time::timeout(read_timeout, read_frame(&mut read, &mut buf)).await
+                    {
+                        Ok(Ok(Some(n))) => n,
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => {
+                            trace!(client = %peer_v4, error = %e, "TCP read error");
+                            break;
+                        }
+                        Err(_) => {
+                            debug!(client = %peer_v4, "TCP read timeout");
+                            break;
+                        }
+                    };
+
+                let fin = process_inbound_packet(
+                    &buf[..frame],
+                    peer_v4,
+                    &sender,
+                    &engine,
+                    &rate_limiter,
+                    &authenticator,
+                    &abuse_detector,
+                    &metrics,
+                )
+                .await;
+
+                if fin {
+                    break;
+                }
+            }
+
+            // Connection closed, cancel the session (stops its response
+            // listener) and remove it from the engine.
+            cancel.cancel();
+            engine.sessions().write().await.remove(&peer_v4);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+    use std::net::Ipv4Addr;
+
+    /// Build a throwaway UDP [`ClientSender`] for engine unit tests.
+    async fn test_udp_sender() -> ClientSender {
+        ClientSender::Udp {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            addr: SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_snapshot(client_addr: &str, game_server: &str, outbound_fd: i32) -> SessionSnapshot {
+        SessionSnapshot {
+            client_addr: client_addr.to_string(),
+            game_server: game_server.to_string(),
+            outbound_fd,
+            fec_enabled: false,
+            fec_k: 4,
+            age_us: 1,
+            idle_us: 1,
+            response_seq: 0,
+            last_client_seq: 0,
+            packets_relayed: 0,
+            bytes_relayed: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relay_engine_session_lifecycle() {
+        let engine = RelayEngine::new(10);
+
+        assert_eq!(engine.active_sessions().await, 0);
+        assert!(engine.can_accept().await);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345);
+        let server = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+
+        let (session, is_new) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(session.client_addr, client);
+        assert_eq!(session.game_server, server);
+        assert!(!session.fec_enabled);
+        assert_eq!(engine.active_sessions().await, 1);
+
+        // Getting same client again should return existing session
+        let (session2, is_new2) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(!is_new2);
+        assert_eq!(engine.active_sessions().await, 1);
+        assert_eq!(session.client_addr, session2.client_addr);
+    }
+
+    #[tokio::test]
+    async fn test_response_listener_claimed_once() {
+        let engine = RelayEngine::new(10);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345);
+        let server = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+
+        let (sess, is_new) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(is_new);
+
+        assert!(
+            sess.claim_response_listener(),
+            "first claim must win the response listener"
+        );
+        assert!(
+            !sess.claim_response_listener(),
+            "second claim must be rejected"
+        );
+        assert_eq!(sess.response_listeners_spawned(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_relay_engine_fec_session() {
+        let engine = RelayEngine::new(10);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345);
+        let server = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+
+        let (session, is_new) = engine
+            .get_or_create_session(client, server, true, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(is_new);
+        assert!(session.fec_enabled);
+        assert_eq!(session.fec_k, 4);
+    }
+
+    #[tokio::test]
+    async fn test_relay_engine_max_sessions() {
+        let engine = RelayEngine::new(1);
+
+        let client1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1000);
+        let client2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 2000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+
+        engine
+            .get_or_create_session(client1, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(engine
+            .get_or_create_session(client2, server, false, 4, test_udp_sender().await)
+            .await
+            .is_err());
+    }
+
+    /// The freeze guard refuses new sessions while an existing session keeps
+    /// resolving, then admits new sessions again once unpacked.
+    #[tokio::test]
+    async fn freeze_handoff_refuses_new_sessions_but_serves_existing() {
+        let engine = RelayEngine::new(10);
+        let client = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 40_010);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 27_017);
+        let other = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 8), 40_011);
+        let sender = test_udp_sender().await;
+
+        let (_, is_new) = engine
+            .get_or_create_session(client, server, false, 4, sender.clone())
+            .await
+            .unwrap();
+        assert!(is_new);
+
+        engine.freeze_handoff();
+        assert!(engine.is_handoff_frozen());
+
+        let (_, is_new) = engine
+            .get_or_create_session(client, server, false, 4, sender.clone())
+            .await
+            .unwrap();
+        assert!(!is_new, "existing session must keep resolving while frozen");
+
+        assert!(
+            engine
+                .get_or_create_session(other, server, false, 4, sender.clone())
+                .await
+                .is_err(),
+            "new session must be refused while frozen"
+        );
+
+        engine.unfreeze_handoff();
+        assert!(!engine.is_handoff_frozen());
+        let (_, is_new) = engine
+            .get_or_create_session(other, server, false, 4, sender)
+            .await
+            .unwrap();
+        assert!(is_new, "new sessions resume after unfreeze");
+    }
+
+    /// The egress budget hard threshold refuses only new sessions: an existing
+    /// session keeps resolving, a new client is rejected, and the refusal
+    /// carries the numbers needed to record why.
+    #[tokio::test]
+    async fn egress_budget_hard_threshold_refuses_only_new_sessions() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let guard = Arc::new(crate::budget::BudgetGuard::new(
+            crate::config::BudgetConfig {
+                enabled: true,
+                max_bytes: 1000,
+                monthly_bytes: 0,
+                soft_threshold_pct: 80,
+                hard_threshold_pct: 100,
+            },
+        ));
+        let engine = RelayEngine::new(10)
+            .with_metrics(Arc::clone(&metrics))
+            .with_budget(guard);
+
+        let existing = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1000);
+        let fresh = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 2000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+        let sender = test_udp_sender().await;
+
+        engine
+            .get_or_create_session(existing, server, false, 4, sender.clone())
+            .await
+            .unwrap();
+
+        metrics.record_relay(1000);
+
+        let (_, is_new) = engine
+            .get_or_create_session(existing, server, false, 4, sender.clone())
+            .await
+            .unwrap();
+        assert!(
+            !is_new,
+            "an existing session must keep resolving at the hard threshold"
+        );
+
+        let err = engine
+            .get_or_create_session(fresh, server, false, 4, sender)
+            .await
+            .unwrap_err();
+        let exceeded = err
+            .downcast_ref::<crate::budget::BudgetExceeded>()
+            .expect("refusal must carry the budget reason");
+        assert_eq!(exceeded.limit, 1000);
+        assert_eq!(exceeded.used, 1000);
+        assert_eq!(exceeded.pct, 100);
+    }
+
+    /// A default-configured guard is inert: with no budget configured the
+    /// engine admits new sessions no matter how much egress has accumulated.
+    #[tokio::test]
+    async fn default_budget_is_disabled() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let guard = Arc::new(crate::budget::BudgetGuard::new(
+            crate::config::BudgetConfig::default(),
+        ));
+        let engine = RelayEngine::new(10)
+            .with_metrics(Arc::clone(&metrics))
+            .with_budget(guard);
+
+        metrics.record_relay(u64::MAX / 2);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 9000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+        let (_, is_new) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .expect("a disabled budget must never refuse a session");
+        assert!(is_new);
+    }
+
+    /// Activity must extend a session's lifetime: a session touched halfway
+    /// through the timeout window survives the first sweep, then expires after
+    /// a full idle window with no further touches.
+    #[tokio::test]
+    async fn test_cleanup_expired_uses_refreshed_activity() {
+        let engine = RelayEngine::new_with_timeout(10, Duration::from_millis(60));
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345);
+        let server = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+
+        let (session, is_new) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(is_new);
+
+        // Touch halfway through the window: a refreshed session stays alive.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        session.touch();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            engine.cleanup_expired().await,
+            0,
+            "an activity touch must extend the session lifetime"
+        );
+
+        // No further traffic: a full idle window now expires it.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(engine.cleanup_expired().await, 1);
+        assert_eq!(engine.active_sessions().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_decode_and_forward() {
+        // Test that we can encode a tunnel packet and decode it
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+        let header = TunnelHeader::new(1, now_us(), src, dst).with_session_token(42);
+        let payload = b"game data payload";
+
+        let packet = header.encode_with_payload(payload);
+
+        let (decoded_header, decoded_payload) = TunnelHeader::decode_with_payload(&packet).unwrap();
+
+        assert_eq!(decoded_header.orig_src_addr(), src);
+        assert_eq!(decoded_header.orig_dst_addr(), dst);
+        assert_eq!(decoded_header.session_token, 42);
+        assert!(!decoded_header.has_fec());
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[tokio::test]
+    async fn test_fec_packet_decode() {
+        // Test FEC v2 packet encoding/decoding
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(104, 26, 1, 50), 7777);
+        let header = TunnelHeader::new_fec(1, now_us(), src, dst);
+
+        let fec_hdr = FecHeader::data(0, 2, 4);
+        let game_data = b"game data with fec";
+
+        // Build: [TunnelHeader v2][FecHeader][payload]
+        let mut pkt = BytesMut::with_capacity(HEADER_SIZE + FEC_HEADER_SIZE + game_data.len());
+        pkt.extend_from_slice(&header.encode());
+        fec_hdr.encode(&mut pkt);
+        pkt.extend_from_slice(game_data);
+
+        // Decode
+        let (decoded_header, payload) = TunnelHeader::decode_with_payload(&pkt).unwrap();
+        assert!(decoded_header.has_fec());
+
+        // Parse FEC header from payload
+        let mut fec_slice: &[u8] = &payload[..FEC_HEADER_SIZE];
+        let decoded_fec = FecHeader::decode(&mut fec_slice).unwrap();
+        assert_eq!(decoded_fec.block_id, 0);
+        assert_eq!(decoded_fec.index, 2);
+        assert_eq!(decoded_fec.k_size, 4);
+        assert!(!decoded_fec.is_parity());
+
+        let decoded_game_data = &payload[FEC_HEADER_SIZE..];
+        assert_eq!(decoded_game_data, game_data);
+    }
+
+    /// Verify that the Linux recvmmsg helper correctly receives data.
+    ///
+    /// Sends several packets to a loopback socket and asserts that
+    /// `recv_batch_async` collects them all in (at most) a few calls.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_linux_batch_recv_collects_packets() {
+        use tokio::net::UdpSocket;
+
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+
+        let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        const N: usize = 10;
+        // Send N packets before we attempt to receive, so they buffer up.
+        for i in 0u8..N as u8 {
+            send_sock.send_to(&[i; 64], recv_addr).await.unwrap();
+        }
+
+        // Let the kernel queue all N packets.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut batch = BatchState::new();
+        let mut received = 0usize;
+
+        // Drain with a reasonable timeout, should empty in 1–2 calls.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        while received < N {
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                recv_batch_async(&recv_sock, &mut batch),
+            )
+            .await
+            {
+                Ok(Ok(n)) => {
+                    received += n;
+                    // Verify lengths look right
+                    for i in 0..n {
+                        assert_eq!(batch.msgs[i].msg_len as usize, 64);
+                    }
+                }
+                Ok(Err(e)) => panic!("recv_batch_async error: {}", e),
+                Err(_timeout) => break,
+            }
+        }
+
+        assert_eq!(
+            received, N,
+            "Expected {} packets via recvmmsg, got {}",
+            N, received
+        );
+    }
+
+    /// Snapshot a UDP session, then adopt it into a fresh engine and verify the
+    /// client, game server, FEC parameters, counters, and single response
+    /// listener are all reconstructed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn handoff_snapshot_and_install_reconstruct_udp_sessions() {
+        let engine = Arc::new(RelayEngine::new(10));
+        let client = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 40_000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 27_015);
+
+        let (session, is_new) = engine
+            .get_or_create_session(client, server, true, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(is_new);
+        session.touch();
+
+        let snapshotter = Arc::clone(&engine);
+        let snapshots =
+            tokio::task::spawn_blocking(move || snapshotter.snapshot_handoff(Instant::now()))
+                .await
+                .unwrap();
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].client_addr, client.to_string());
+        assert_eq!(snapshots[0].game_server, server.to_string());
+        assert!(snapshots[0].fec_enabled);
+        assert_eq!(snapshots[0].fec_k, 4);
+        assert!(snapshots[0].idle_us <= snapshots[0].age_us);
+
+        // Simulate an `execve`: the outgoing process image disappears, so its
+        // reactor registration is gone and the fd stays open for the adopter.
+        // `into_std` deregisters the socket; forgetting the std handle keeps the
+        // fd alive instead of closing it as the old session is torn down.
+        drop(session);
+        let original = engine.sessions().write().await.remove(&client).unwrap();
+        let original = Arc::try_unwrap(original).unwrap();
+        let outbound = Arc::try_unwrap(original.outbound_socket).unwrap();
+        std::mem::forget(outbound.into_std().unwrap());
+
+        let adopted = RelayEngine::new(10);
+        let data_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let metrics = Arc::new(ProxyMetrics::new());
+
+        let installed = adopted
+            .install_handoff_sessions(&snapshots, data_socket, metrics)
+            .await;
+        assert_eq!(installed, 1);
+
+        let sessions = adopted.sessions();
+        let guard = sessions.read().await;
+        let restored = guard.get(&client).expect("client session installed");
+        assert_eq!(restored.game_server, server);
+        assert!(restored.fec_enabled);
+        assert_eq!(restored.fec_k, 4);
+        assert_eq!(restored.response_listeners_spawned(), 1);
+        assert_eq!(restored.pending_forward_us.load(Ordering::Relaxed), 0);
+    }
+
+    /// TCP sessions cannot survive an `execve`; they must be skipped.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn handoff_snapshot_skips_tcp_sessions() {
+        let engine = Arc::new(RelayEngine::new(10));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(listener_addr);
+        let (accepted, connected) = tokio::join!(listener.accept(), connect);
+        let (server_stream, _) = accepted.unwrap();
+        let _client_stream = connected.unwrap();
+        let (_read, write) = server_stream.into_split();
+
+        let sender = ClientSender::Tcp {
+            write: Arc::new(tokio::sync::Mutex::new(write)),
+            cancel: CancellationToken::new(),
+        };
+        let client = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 6), 40_001);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 27_016);
+        engine
+            .get_or_create_session(client, server, false, 4, sender)
+            .await
+            .unwrap();
+
+        let snapshotter = Arc::clone(&engine);
+        let snapshots =
+            tokio::task::spawn_blocking(move || snapshotter.snapshot_handoff(Instant::now()))
+                .await
+                .unwrap();
+
+        assert!(snapshots.is_empty(), "TCP sessions must be skipped");
+    }
+
+    /// A snapshot that is skipped before adoption (here: an unparseable client
+    /// address) must have its outbound fd closed rather than leaked. A private
+    /// pipe is used as the fd so the close is observable through EPIPE.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn install_handoff_sessions_closes_outbound_fd_for_skipped_snapshot() {
+        let mut pipe_fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` writes two valid descriptors into the array.
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let (read_end, write_end) = (pipe_fds[0], pipe_fds[1]);
+
+        let engine = RelayEngine::new(10);
+        let data_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let metrics = Arc::new(ProxyMetrics::new());
+        let snaps = vec![test_snapshot(
+            "not-an-address",
+            "198.51.100.9:27015",
+            read_end,
+        )];
+
+        let installed = engine
+            .install_handoff_sessions(&snaps, data_socket, metrics)
+            .await;
+        assert_eq!(installed, 0);
+        assert_eq!(engine.active_sessions().await, 0);
+
+        // The read end was closed, so the write end has no reader: EPIPE.
+        let byte = [0u8; 1];
+        // SAFETY: `write_end` is a live pipe descriptor and `byte` has length 1.
+        let rc =
+            unsafe { libc::write(write_end, byte.as_ptr() as *const libc::c_void, byte.len()) };
+        let write_errno = std::io::Error::last_os_error();
+        assert_eq!(
+            rc, -1,
+            "a skipped snapshot's outbound fd must be closed, not leaked"
+        );
+        assert_eq!(write_errno.raw_os_error(), Some(libc::EPIPE));
+        // SAFETY: `write_end` is still owned by this test.
+        unsafe { libc::close(write_end) };
+    }
+
+    // ── TCP-tunnelled connection lifecycle ─────────────────────
+
+    fn tcp_tuple(src_port: u16) -> Tcp5Tuple {
+        Tcp5Tuple {
+            src_ip: Ipv4Addr::new(192, 168, 1, 100),
+            src_port,
+            dst_ip: Ipv4Addr::new(104, 26, 1, 50),
+            dst_port: 25565,
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_connection_creation_counts_against_the_session_budget() {
+        let engine = RelayEngine::new(1);
+
+        let (conn, is_new) = engine
+            .get_or_create_tcp_connection(tcp_tuple(12345), 4)
+            .await
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(engine.tcp_connection_count().await, 1);
+
+        // Same tuple resolves to the existing connection, not a new one.
+        let (same, is_new_again) = engine
+            .get_or_create_tcp_connection(tcp_tuple(12345), 4)
+            .await
+            .unwrap();
+        assert!(!is_new_again);
+        assert!(Arc::ptr_eq(&conn, &same));
+
+        // A different 5-tuple would exceed max_sessions (1), so it is refused.
+        assert!(engine
+            .get_or_create_tcp_connection(tcp_tuple(23456), 4)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_idle_sweep_removes_stale_connections() {
+        let engine = RelayEngine::new_with_timeout(10, Duration::from_millis(20));
+
+        let (_conn, is_new) = engine
+            .get_or_create_tcp_connection(tcp_tuple(12345), 4)
+            .await
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(engine.tcp_connection_count().await, 1);
+
+        // Not yet idle past the timeout.
+        assert_eq!(engine.cleanup_expired_tcp().await, 0);
+
+        // Idle past the 20 ms timeout: swept, task cancellation token fired.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(engine.cleanup_expired_tcp().await, 1);
+        assert_eq!(engine.tcp_connection_count().await, 0);
+    }
+
+    /// The connector dials the real server, splices client payloads into it,
+    /// and relays server bytes back to the client as v5 packets.
+    #[tokio::test]
+    async fn tcp_connection_dials_buffers_and_splices() {
+        // A local echo server stands in for the game server.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let client_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 39000);
+        let client_sock = Arc::new(UdpSocket::bind(client_addr).await.unwrap());
+        let sender = ClientSender::Udp {
+            socket: Arc::clone(&client_sock),
+            addr: client_addr,
+        };
+
+        let tuple = Tcp5Tuple {
+            src_ip: Ipv4Addr::new(192, 168, 1, 100),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(127, 0, 0, 1),
+            dst_port: server_addr.port(),
+        };
+        let mut header = TunnelHeader::new_fec(
+            1,
+            1_000_000,
+            SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345),
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), server_addr.port()),
+        );
+        header.version = lightspeed_protocol::PROTOCOL_VERSION_TCP;
+        let engine = Arc::new(RelayEngine::new(10));
+        let conn = Arc::new(TcpConnState::new(tuple, 4, CancellationToken::new()));
+        engine
+            .tcp_table()
+            .write()
+            .await
+            .insert(tuple, Arc::clone(&conn));
+
+        let sender_for_task = sender.clone();
+        let engine_for_task = Arc::clone(&engine);
+        let conn_for_task = Arc::clone(&conn);
+        let header_for_task = header.clone();
+        tokio::spawn(async move {
+            run_tcp_connection(
+                conn_for_task,
+                client_addr,
+                sender_for_task,
+                header_for_task,
+                engine_for_task,
+                Arc::new(ProxyMetrics::new()),
+            )
+            .await;
+        });
+
+        // Data arriving before the dial completes is buffered and written once
+        // connected. The command channel sender must stay alive (as it does on
+        // the real `TcpConnState`) so the task's recv arm does not see a
+        // closed channel and tear down before reading the echo.
+        let payload = b"hello minecraft";
+        let cmd_tx = conn.take_conn_tx().unwrap();
+        cmd_tx
+            .send(TcpCmd::Data(bytes::Bytes::copy_from_slice(payload)))
+            .await
+            .unwrap();
+
+        // The server's echo comes back as a v5 packet on the client socket.
+        let mut recv_buf = [0u8; 512];
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), client_sock.recv_from(&mut recv_buf))
+                .await
+                .expect("server echo must reach the client")
+                .unwrap();
+        let (resp_header, resp_payload) =
+            TunnelHeader::decode_with_payload(&recv_buf[..n]).unwrap();
+        assert!(resp_header.has_tcp());
+        assert!(resp_header.has_fec());
+        // Skip the 4-byte FEC header, decode the TCP extension, and check the
+        // game payload round-tripped through the echo server.
+        let (tcp_ext, game) =
+            decode_tcp_payload(&resp_payload[FEC_HEADER_SIZE..]).expect("tcp ext");
+        assert_eq!(
+            tcp_ext.tcp_ack, 2,
+            "the ACK acknowledges the first data byte"
+        );
+        assert_eq!(game, payload);
+
+        server.abort();
+        engine.remove_tcp_connection(&tuple).await;
+    }
+
+    // ── Proxy-side geo session recording ────────────────────────
+
+    fn test_geo_resolver() -> Arc<dyn GeoResolver> {
+        Arc::new(|ip: Ipv4Addr| {
+            if ip == Ipv4Addr::new(198, 51, 100, 9) {
+                Some("DE".to_string())
+            } else {
+                Some("US".to_string())
+            }
+        })
+    }
+
+    fn test_geo_engine(metrics: &Arc<ProxyMetrics>, public_ip: Option<Ipv4Addr>) -> RelayEngine {
+        RelayEngine::new(10).with_geo(GeoState {
+            resolver: test_geo_resolver(),
+            metrics: Arc::clone(metrics),
+            public_ip,
+            control_port: 4433,
+            data_port: 4434,
+        })
+    }
+
+    #[tokio::test]
+    async fn new_session_records_country_pair() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let engine = test_geo_engine(&metrics, None);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 50_000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 27_015);
+
+        let (_, is_new) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(is_new);
+
+        let agg = metrics.geo.lock().unwrap();
+        assert_eq!(
+            agg.cells.get(&("US".to_string(), "DE".to_string())),
+            Some(&1),
+            "a new session must contribute one (src,dst) country pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_session_not_double_counted() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let engine = test_geo_engine(&metrics, None);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 50_000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 27_015);
+
+        let (_, first) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        let (_, second) = engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+        assert!(first && !second);
+
+        let agg = metrics.geo.lock().unwrap();
+        assert_eq!(
+            agg.cells.get(&("US".to_string(), "DE".to_string())),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn self_tunnel_skipped_by_public_ip() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let engine = test_geo_engine(&metrics, Some(Ipv4Addr::new(198, 51, 100, 9)));
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 50_000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 27_015);
+
+        engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+
+        let agg = metrics.geo.lock().unwrap();
+        assert!(agg.cells.is_empty(), "a self-tunnel must not record a pair");
+        assert_eq!(agg.skipped_self_tunnel, 1);
+    }
+
+    #[tokio::test]
+    async fn self_tunnel_skipped_by_port_heuristic() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let engine = test_geo_engine(&metrics, None);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 50_000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 4433);
+
+        engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+
+        let agg = metrics.geo.lock().unwrap();
+        assert!(agg.cells.is_empty(), "a self-tunnel must not record a pair");
+        assert_eq!(agg.skipped_self_tunnel, 1);
+    }
+
+    #[tokio::test]
+    async fn data_port_destination_is_not_skipped() {
+        // Regression: the fallback heuristic must not treat a legitimate
+        // destination on the data port as a self-tunnel, or it would hide
+        // real demand on port 4434.
+        let metrics = Arc::new(ProxyMetrics::new());
+        let engine = test_geo_engine(&metrics, None);
+
+        let client = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 50_000);
+        let server = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 4434);
+
+        engine
+            .get_or_create_session(client, server, false, 4, test_udp_sender().await)
+            .await
+            .unwrap();
+
+        let agg = metrics.geo.lock().unwrap();
+        assert_eq!(
+            agg.cells.get(&("US".to_string(), "DE".to_string())),
+            Some(&1),
+            "a destination on the data port must still be recorded"
+        );
+        assert_eq!(agg.skipped_self_tunnel, 0);
+    }
+
+    // ── Socket hygiene (WIN 1) ──────────────────────────────────
+
+    #[test]
+    fn socket_buffer_requests_are_clamped_to_sane_bounds() {
+        assert_eq!(clamp_buf(1), SOCK_BUF_MIN as u32);
+        assert_eq!(clamp_buf(usize::MAX), SOCK_BUF_MAX as u32);
+        assert_eq!(clamp_buf(128 * 1024), 128 * 1024);
+        assert!(SocketRole::Data.rcvbuf() >= SocketRole::Session.rcvbuf());
+    }
+
+    /// A refused option must be counted and skipped, never fatal: `fd = -1`
+    /// makes all three `setsockopt` calls fail with EBADF.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_socket_option_is_recorded_and_non_fatal() {
+        let metrics = ProxyMetrics::new();
+        let report = configure_socket_fd(-1, SocketRole::Data, &metrics);
+        assert_eq!(
+            report.failures, 3,
+            "receive buffer, send buffer and busy-poll are each attempted once"
+        );
+        assert!(report.rcvbuf_effective.is_none());
+        assert!(report.sndbuf_effective.is_none());
+        assert!(report.busy_poll.is_none());
+        assert_eq!(metrics.socket_opts_failed.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.socket_opts_applied.load(Ordering::Relaxed), 0);
+    }
+
+    /// A bound socket accepts the buffers and the result is observable in the
+    /// Prometheus surface. Busy-poll may or may not be supported, so only the
+    /// buffer counters are asserted.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn data_socket_tuning_applies_and_is_observable() {
+        let metrics = ProxyMetrics::new();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let report = configure_socket(&socket, SocketRole::Data, &metrics);
+
+        assert!(
+            report.rcvbuf_effective.unwrap() >= SOCK_BUF_MIN as u32,
+            "the kernel must return at least the floor it was asked for"
+        );
+        assert!(report.sndbuf_effective.is_some());
+        assert!(metrics.socket_opts_applied.load(Ordering::Relaxed) >= 2);
+
+        let prom = metrics.to_prometheus("test", "node");
+        assert!(prom.contains("lightspeed_socket_opts_applied_total"));
+        assert!(prom.contains("lightspeed_socket_opts_failed_total"));
+        assert!(prom.contains("lightspeed_busy_poll_sockets"));
+    }
+
+    /// The data socket is tuned before the receive loop starts; the existing
+    /// `recvmmsg` path must still drain every queued datagram afterwards.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tuning_does_not_disturb_the_recvmmsg_path() {
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let metrics = ProxyMetrics::new();
+        configure_data_socket(&recv_sock, &metrics);
+        let recv_addr = recv_sock.local_addr().unwrap();
+
+        let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for i in 0u8..8 {
+            send_sock.send_to(&[i; 32], recv_addr).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut batch = BatchState::new();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            recv_batch_async(&recv_sock, &mut batch),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(n >= 1);
+        for i in 0..n {
+            assert_eq!(batch.msgs[i].msg_len as usize, 32);
+        }
+    }
+}

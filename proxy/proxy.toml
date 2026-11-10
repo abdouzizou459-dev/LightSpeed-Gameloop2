@@ -1,0 +1,51 @@
+# LightSpeed Proxy — Default Configuration
+# Override by mounting your own proxy.toml or setting CLI flags.
+
+[server]
+node_id     = "proxy-dev"
+region      = "local"
+max_clients = 100
+# Public IP of this relay. When set, sessions destined to this address are
+# treated as self-tunnels and excluded from geo aggregation.
+# public_ip = "203.0.113.7"
+
+[network]
+data_port    = 4434
+control_port = 4433
+health_port  = 8080
+
+[security]
+# Token auth: clients register over QUIC and stamp their session token into every
+# data-plane packet. Unregistered clients are rejected.
+require_auth                = true
+max_amplification_ratio     = 2.0
+max_destinations_per_window = 10
+ban_duration_secs           = 3600
+
+[rate_limit]
+max_pps_per_client = 1000
+max_bps_per_client = 1000000
+max_connections    = 200
+
+[metrics]
+enabled       = true
+interval_secs = 10
+
+# Per-relay egress budget guard. Disabled by default: with enabled = false the
+# relay behaves exactly as it did before this guard existed. When enabled:
+#   * soft_threshold_pct  logs a warning and flips a metric once reached
+#   * hard_threshold_pct  refuses NEW sessions; existing sessions keep relaying
+# max_bytes is a cumulative ceiling; monthly_bytes is a per-calendar-month
+# allowance. Set either or both (the higher-utilization one is binding).
+[budget]
+enabled            = false
+max_bytes          = 0
+monthly_bytes      = 0
+soft_threshold_pct = 80
+hard_threshold_pct = 100
+
+[geo]
+# Proxy-side IP-to-country session aggregation. Only two-letter country codes
+# are exported; no raw IP is stored or logged.
+enabled   = true
+mmdb_path = "/opt/lightspeed/geoip/dbip-country-lite.mmdb"

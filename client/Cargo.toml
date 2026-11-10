@@ -1,0 +1,105 @@
+[package]
+name = "lightspeed-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LightSpeed game network optimizer — client application"
+
+[package.metadata.wix]
+upgrade-guid = "97B46AF6-E50E-49C3-BE72-A8A5B5C8BDC6"
+path-guid = "5CF0E353-A6F5-49BC-A30F-7957AFC20EA6"
+license = false
+eula = false
+
+# Ship the client with QUIC (token auth) + WinDivert (Windows interception).
+# `windivert-redirect` is safe to enable on every target: its `windivert`
+# dependency is `cfg(windows)`-gated, so non-Windows builds simply skip it.
+[package.metadata.dist]
+features = ["quic", "windivert-redirect"]
+# The GUI is the primary Windows entry point, but the CLI client also ships a
+# Windows zip for headless/power users.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+installers = ["shell"]
+# Bundle the WinDivert DLL + signed kernel driver next to the exe (Windows).
+include = ["windivert/WinDivert.dll", "windivert/WinDivert64.sys", "windivert/LICENSE.windivert"]
+
+[[bin]]
+name = "lightspeed"
+path = "src/main.rs"
+
+[lib]
+name = "lightspeed_client"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enable QUIC control plane (requires C compiler for ring)
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "lightspeed-protocol/quic"]
+# Enable pcap packet capture (requires Npcap/libpcap)
+pcap-capture = ["dep:pcap"]
+# Enable WinDivert active redirect (Windows only; requires WinDivert64.sys next to exe)
+# Enable ML route prediction
+ml = ["dep:linfa", "dep:linfa-linear", "dep:ndarray", "dep:bincode"]
+# WinDivert packet interception. Windows-only at runtime, but safe to enable on
+# any target — the `windivert` dependency is `cfg(windows)`-gated, so non-Windows
+# builds skip it (verified: `cargo check --features windivert-redirect` on Linux).
+windivert-redirect = ["dep:windivert", "dep:windivert-sys", "dep:windows"]
+# Enable all features
+full = ["quic", "pcap-capture", "ml"]  # windivert-redirect excluded (Windows-only)
+
+[dependencies]
+lightspeed-protocol = { workspace = true, features = ["tokio"] }
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+ring = "0.17"
+base64 = "0.23"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+# Optional dependencies (require C compiler or system libraries)
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "0.14", optional = true }
+pcap = { version = "2", optional = true }
+linfa = { version = "0.8", optional = true }
+linfa-linear = { version = "0.8", optional = true }
+ndarray = { version = "0.16", optional = true }
+bincode = { version = "1", optional = true }
+rand = "0.9"
+sys-locale = "0.3"
+# Raw socket construction for the direct ICMP latency prober. Already present
+# transitively (tokio/quinn) in Cargo.lock, so this adds no new crate download.
+socket2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windivert = { version = "0.7.0-beta.4", optional = true, features = ["vendored"] }
+# Raw FFI used by `interceptor::windivert_handle` for an owned handle whose
+# `shutdown(&self)` can unblock a concurrent blocking recv. The `windows` types
+# must match windivert-sys's own 0.48 dependency so `HANDLE` is the same type.
+# `vendored` reaches windivert-sys through the `windivert` dependency above, so
+# it is intentionally not repeated here.
+windivert-sys = { version = "0.11.0-beta.2", optional = true }
+windows = { version = "0.62", optional = true, default-features = false, features = ["Win32_Foundation"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio-test = "0.4"

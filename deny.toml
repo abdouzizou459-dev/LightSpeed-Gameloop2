@@ -1,0 +1,62 @@
+# cargo-deny v2 configuration for LightSpeed
+[advisories]
+yanked = "warn"
+ignore = [
+  # -- unmaintained GTK3 bindings (lightspeed-gui tray-icon transitive dep) --
+  { id = "RUSTSEC-2024-0412", reason = "gdk unmaintained; GUI-only transitive dep via tray-icon, no impact on proxy" },
+  { id = "RUSTSEC-2024-0413", reason = "atk unmaintained; GUI-only transitive dep via tray-icon, no impact on proxy" },
+  { id = "RUSTSEC-2024-0415", reason = "gtk unmaintained; GUI-only transitive dep via tray-icon, no impact on proxy" },
+  { id = "RUSTSEC-2024-0416", reason = "atk-sys unmaintained; GUI-only transitive dep via tray-icon, no impact on proxy" },
+  { id = "RUSTSEC-2024-0418", reason = "gdk-sys unmaintained; GUI-only transitive dep via tray-icon, no impact on proxy" },
+  { id = "RUSTSEC-2024-0419", reason = "gtk3-macros unmaintained; GUI-only transitive dep, no runtime security impact" },
+  { id = "RUSTSEC-2024-0420", reason = "gtk-sys unmaintained; GUI-only transitive dep via tray-icon, no impact on proxy" },
+  # -- other unmaintained utility crates pulled in by GUI / proptest stack ---
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; build-time proc-macro only, no runtime impact" },
+  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; macro-only crate, zero runtime security impact" },
+  # -- protobuf (Prometheus metrics only, no user-controlled parsing) --------
+  { id = "RUSTSEC-2024-0437", reason = "protobuf used only in prometheus monitoring; no user-controlled parsing surface" },
+  # -- unmaintained crates with no safe upgrade path -------------------------
+  { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; v1.3.3 considered complete by maintainers, zero runtime risk" },
+  { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; linfa transitive dep, upstream migration tracked" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; GUI font parsing via egui, no network-facing code" },
+  # -- zvariant/zbus_names moved into zbus and are no longer standalone -------
+  { id = "RUSTSEC-2026-0370", reason = "zvariant consolidating into zbus; Linux accessibility stack via eframe/accesskit, GUI-only, no network surface" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names consolidating into zbus; Linux accessibility stack via eframe/accesskit, GUI-only" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive consolidating into zbus; build-time derive for the Linux accessibility stack" },
+]
+
+[licenses]
+allow = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib",
+  # LightSpeed custom license (workspace crates)
+  "LicenseRef-LightSpeed-NC-1.0",
+  # Unicode / ICU -- idna/url/webbrowser chain (GUI only)
+  "Unicode-3.0",         # icu_collections, icu_locale_core, icu_normalizer, etc.
+  # GUI crate additional licenses:
+  "BSL-1.0",             # clipboard-win, error-code (arboard -> egui-winit chain)
+  "OFL-1.1",             # epaint_default_fonts (egui embedded fonts)
+  "MPL-2.0",             # option-ext (dirs -> tray-icon chain)
+  # WinDivert (kernel-level packet filter) -- LGPL-3.0, used only in lightspeed-client
+  "LGPL-3.0-or-later",   # windivert, windivert-sys
+  # webpki-root-certs (TLS trust anchors, bundled in binary)
+  "CDLA-Permissive-2.0",
+  "CC0-1.0",             # hexf-parse (naga -> wgpu -> egui chain, GUI only)
+  "Ubuntu-font-1.0",    # epaint_default_fonts (egui embedded fonts)
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards         = "allow"
+deny = []
+skip = [
+  { name = "syn" }, { name = "windows-sys" }, { name = "windows-targets" },
+  { name = "windows_x86_64_msvc" }, { name = "windows_x86_64_gnu" },
+  { name = "windows_aarch64_msvc" }, { name = "windows_i686_msvc" },
+  { name = "windows_i686_gnu" }, { name = "hashbrown" }, { name = "redox_syscall" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

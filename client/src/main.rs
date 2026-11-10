@@ -1,0 +1,1608 @@
+//! # LightSpeed Client
+//!
+//! NOTE: `dead_code` is allowed because the binary shares its module tree with
+//! the library (`lib.rs`). Items used only by the GUI library path appear dead
+//! from the binary's perspective, and vice versa. Individual items are gated
+//! behind feature flags and platform-specific compilation.
+#![allow(dead_code)]
+//!
+//! Zero-cost global network optimizer for multiplayer games.
+//! Captures game UDP packets and tunnels them through optimally-selected
+//! proxy nodes to reduce latency via better routing paths.
+
+mod capture;
+mod cli;
+mod config;
+mod error;
+mod games;
+mod interceptor;
+mod latency;
+mod ml;
+mod modes;
+mod paths;
+mod process;
+mod processes;
+mod profiles;
+mod quic;
+mod redirect;
+mod registry;
+mod route;
+mod session;
+mod telemetry;
+mod tunnel;
+mod warp;
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
+
+use clap::Parser;
+use tracing::{error, info, warn};
+
+use telemetry::TelemetryCollector;
+
+use cli::{parse_proxy_addr, Cli};
+use interceptor::{effective_interception_mode, InterceptionMode, ResolvedMode};
+use modes::{
+    benchmark_mode::run_benchmark,
+    capture_mode::run_capture_mode,
+    control_test::run_control_test,
+    demo_mode::run_demo,
+    diagnose_mode::{run_diagnose, DEFAULT_WINDOW},
+    intercept_mode::run_intercept_mode,
+    keepalive::run_keepalive_mode,
+    live_test::run_live_test,
+    proxy_probe::{probe_labeled, select_best_proxy, ProbeCandidate},
+    smoke_test::run_smoke_test,
+    tunnel_test::run_tunnel_test,
+    watch_mode::run_watch_mode,
+};
+use route::ProxyHealth;
+use tunnel::adaptive::AdaptiveConfig;
+use tunnel::relay::UdpRelay;
+
+/// Default config template written by `--write-config`.
+const EXAMPLE_CONFIG: &str = include_str!("../lightspeed.example.toml");
+
+/// A resolved proxy choice plus the full set of candidate relays it was
+/// discovered from, for feeding multipath/continuous rerouting. Each candidate
+/// carries the registry region so re-selection can still place an unmeasured
+/// relay.
+struct ResolvedProxy {
+    addr: SocketAddrV4,
+    candidates: Vec<ProbeCandidate>,
+}
+
+/// Zeroes the process-global data-plane tokens when the client exits.
+///
+/// A supervised reconnect or mode switch must preserve the last relay-issued
+/// token, so tokens are cleared only here, at the single explicit process
+/// shutdown point, never on a transient disconnect.
+struct TokenResetOnShutdown;
+
+impl Drop for TokenResetOnShutdown {
+    fn drop(&mut self) {
+        crate::session::reset_all_tokens();
+    }
+}
+
+/// Resolve the proxy to use: explicit `--proxy`, else auto-select from
+/// configured servers, else discover from the signed registry, else a
+/// localhost dev default.
+async fn resolve_proxy_addr(cli: &Cli, config: &config::Config) -> anyhow::Result<ResolvedProxy> {
+    if let Some(ref proxy_str) = cli.proxy {
+        let addr = parse_proxy_addr(proxy_str)?;
+        info!("🌐 Proxy (explicit): {}", addr);
+        return Ok(ResolvedProxy {
+            addr,
+            candidates: vec![(
+                format!("proxy-{}", addr.ip()),
+                proxy_str.clone(),
+                "unknown".to_string(),
+            )],
+        });
+    }
+    if !config.proxy.servers.is_empty() {
+        let strategy = cli
+            .route_strategy
+            .as_deref()
+            .unwrap_or(config.route.strategy.as_str());
+        let game_server_addr = cli
+            .game_server
+            .as_ref()
+            .and_then(|s| parse_proxy_addr(s).ok())
+            .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
+        info!(
+            "🔍 Probing {} configured proxies (strategy: {})...",
+            config.proxy.servers.len(),
+            strategy
+        );
+        let candidates: Vec<ProbeCandidate> = config
+            .proxy
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    format!("configured-{}", i),
+                    s.clone(),
+                    "unknown".to_string(),
+                )
+            })
+            .collect();
+        let selected = select_best_proxy(
+            &candidates,
+            config.proxy.data_port,
+            config.proxy.quic_port,
+            game_server_addr,
+            strategy,
+        )
+        .await?;
+        info!(
+            "🌐 Proxy (auto-selected): {} [{}] - {:.1}ms latency, strategy: {:?}",
+            selected.primary.data_addr,
+            selected.primary.id,
+            selected.primary.latency_us.unwrap_or(0) as f64 / 1000.0,
+            selected.strategy,
+        );
+        if !selected.backups.is_empty() {
+            info!(
+                "   Backups: {}",
+                selected
+                    .backups
+                    .iter()
+                    .map(|p| format!(
+                        "{} ({:.1}ms)",
+                        p.id,
+                        p.latency_us.unwrap_or(0) as f64 / 1000.0
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(ResolvedProxy {
+            addr: selected.primary.data_addr,
+            candidates,
+        });
+    }
+
+    // Zero-config registry discovery: resolve relays from the signed community
+    // registry when no explicit proxy or configured servers are present. An
+    // explicit --registry / config.registry.url wins over the built-in default.
+    let registry_url = cli
+        .registry
+        .as_deref()
+        .or(config.registry.url.as_deref())
+        .unwrap_or(crate::registry::DEFAULT_REGISTRY_URL);
+    let operator_key = config
+        .registry
+        .operator_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .unwrap_or(crate::registry::DEFAULT_OPERATOR_PUBKEY_B64);
+    match crate::registry::discover_relays(registry_url, operator_key, config.proxy.quic_port) {
+        Ok(relays) if !relays.is_empty() => {
+            let strategy = cli
+                .route_strategy
+                .as_deref()
+                .unwrap_or(config.route.strategy.as_str());
+            let game_server_addr = cli
+                .game_server
+                .as_ref()
+                .and_then(|s| parse_proxy_addr(s).ok())
+                .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
+            let candidates: Vec<ProbeCandidate> = relays
+                .iter()
+                .map(|relay| {
+                    (
+                        relay.node_id.clone(),
+                        relay.addr.clone(),
+                        relay.region.clone(),
+                    )
+                })
+                .collect();
+            for relay in &relays {
+                if let Ok(a) = parse_proxy_addr(&relay.addr) {
+                    telemetry::paths::register_relay_node(a, &relay.node_id);
+                }
+            }
+            info!(
+                "🔍 Registry: {} relay(s) discovered; probing (strategy: {})...",
+                candidates.len(),
+                strategy
+            );
+            let selected = select_best_proxy(
+                &candidates,
+                config.proxy.data_port,
+                config.proxy.quic_port,
+                game_server_addr,
+                strategy,
+            )
+            .await?;
+            info!(
+                "🌐 Proxy (registry): {} [{}], {:.1}ms latency, strategy: {:?}",
+                selected.primary.data_addr,
+                selected.primary.id,
+                selected.primary.latency_us.unwrap_or(0) as f64 / 1000.0,
+                selected.strategy,
+            );
+            return Ok(ResolvedProxy {
+                addr: selected.primary.data_addr,
+                candidates,
+            });
+        }
+        Ok(_) => warn!("Registry returned no relays; falling back to default proxy"),
+        Err(e) => warn!("Registry discovery failed: {e}; falling back to default proxy"),
+    }
+
+    let default = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 4434);
+    warn!("No proxy specified, using default: {}", default);
+    Ok(ResolvedProxy {
+        addr: default,
+        candidates: vec![],
+    })
+}
+
+/// Resolve the server `--diagnose` measures, in precedence order: an explicit
+/// `--target` or `--game-server`, else the first public UDP route of the
+/// running game.
+fn resolve_diagnose_server(cli: &Cli) -> anyhow::Result<SocketAddrV4> {
+    if let Some(target) = cli.target.as_deref().or(cli.game_server.as_deref()) {
+        return parse_proxy_addr(target);
+    }
+    let game = match cli.game.as_deref() {
+        Some(name) => Some(games::resolve(name)?),
+        None => games::auto_detect().ok(),
+    };
+    let game = game.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--diagnose needs a server: pass --target <ip:port>, or run it while a supported game is connected"
+        )
+    })?;
+    let found = interceptor::process_scanner::find_game_process(&game.process_names()).ok_or_else(
+        || {
+            anyhow::anyhow!(
+                "--diagnose could not find the {} process; pass --target <ip:port> instead",
+                game.name()
+            )
+        },
+    )?;
+    let route = found.routes.first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--diagnose found {} (PID {}) but no active server route; connect to a server first or pass --target",
+            game.name(),
+            found.pid
+        )
+    })?;
+    Ok(route.remote)
+}
+
+/// The game server known before registration: an explicit `--game-server` or
+/// `--server-addr`, else the running game's first discovered route.
+///
+/// Handed to the relay at registration so it can resolve the destination region
+/// from its MMDB. Returns `None` when no server is known yet, in which case the
+/// relay simply omits the region.
+fn known_game_server(cli: &Cli) -> Option<Ipv4Addr> {
+    if let Some(raw) = cli.game_server.as_deref().or(cli.server_addr.as_deref()) {
+        return parse_proxy_addr(raw).ok().map(|addr| *addr.ip());
+    }
+    let game = games::resolve(cli.game.as_deref()?).ok()?;
+    let found = interceptor::process_scanner::find_game_process(&game.process_names())?;
+    found.routes.first().map(|route| *route.remote.ip())
+}
+
+/// Spawn the continuous re-routing loop when multiple relays are configured.
+fn start_continuous_rerouting(candidates: &[ProbeCandidate], config: &config::Config, cli: &Cli) {
+    if candidates.len() <= 1 {
+        return;
+    }
+    let strategy = cli
+        .route_strategy
+        .clone()
+        .unwrap_or_else(|| config.route.strategy.clone());
+    let game_server = cli
+        .game_server
+        .as_ref()
+        .and_then(|s| parse_proxy_addr(s).ok())
+        .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(crate::modes::reroute::run_continuous_rerouting(
+        candidates.to_vec(),
+        config.proxy.data_port,
+        config.proxy.quic_port,
+        game_server,
+        strategy,
+        if config.route.multipath {
+            config.route.multipath_max_paths
+        } else {
+            1
+        },
+        rx,
+    ));
+}
+
+/// Whether telemetry runs for this invocation.
+///
+/// On by default: the config default is `true`, so telemetry runs unless the
+/// user opts out. `--telemetry` forces it on even if the config disables it,
+/// while `--no-telemetry` is a hard override that always wins.
+fn telemetry_enabled(cli: &Cli, config: &config::Config) -> bool {
+    !cli.no_telemetry && (cli.telemetry || config.general.telemetry)
+}
+
+/// Resolve the do-no-harm bypass config from CLI flags and `[route]` settings.
+fn resolved_bypass_config(cli: &Cli, config: &config::Config) -> interceptor::bypass::BypassConfig {
+    interceptor::bypass::BypassConfig::resolve(
+        cli.no_bypass,
+        cli.force_direct,
+        cli.bypass_dry_run,
+        &config.route.bypass,
+        config.route.bypass_margin_ms,
+        config.route.bypass_keep_ms,
+        config.route.bypass_dwell_s,
+        config.route.bypass_probation_s,
+    )
+}
+
+// Modes that return before the shared dispatch (--watch, --start-interceptor)
+// still tunnel real gameplay, so they must spawn the periodic flush themselves.
+// Without this they record samples locally and never send them, which is
+// invisible because the packet counters keep moving.
+fn spawn_session_telemetry_flush(
+    collector: &Option<Arc<TelemetryCollector>>,
+    proxy_addr: std::net::SocketAddrV4,
+    game_key: &str,
+) {
+    let Some(tc) = collector else { return };
+    let ctx = telemetry::context::TelemetryContext {
+        game_id: lightspeed_protocol::game_id::id_for_key(game_key),
+        country: telemetry::context::detect_country(),
+    };
+    telemetry::spawn_periodic_flush(
+        tc.as_ref().clone(),
+        proxy_addr.ip().to_string(),
+        Some(proxy_addr),
+        ctx,
+    );
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // ── Tracing ───────────────────────────────────────────────────
+    let filter = if cli.verbose { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .init();
+
+    info!("⚡ LightSpeed v{} starting", env!("CARGO_PKG_VERSION"));
+
+    // ── Configuration ─────────────────────────────────────────────
+    let config = config::Config::load(&cli.config).unwrap_or_else(|e| {
+        warn!("Config not found ({}), using defaults", e);
+        config::Config::default()
+    });
+
+    // ── User profiles (custom games + saved servers) ────────────
+    //
+    // Loaded once per process from the per-OS profiles.toml (or --profiles),
+    // then cached for the life of the process. `--no-user-profiles` skips the
+    // file entirely. The tolerant loader logs every entry it skipped, and a
+    // missing file is normal (a fresh install has none).
+    let profile_store = profiles::init(&profiles::StoreConfig::from_cli_flags(
+        cli.profiles.as_deref(),
+        cli.no_user_profiles,
+    ));
+
+    // ── Adaptive FEC policy (opt-in, shared by every path) ────────
+    //
+    // One policy feeds the relay and the inline paths, so a single opt-in
+    // gates every data plane. The default is disabled, which keeps the fixed
+    // K=4/P=1 behaviour byte-for-byte.
+    let adaptive_cfg = AdaptiveConfig {
+        enabled: cli.adaptive_fec || config.tunnel.adaptive_fec,
+        k_size: cli.fec_k,
+        max_overhead_pct: if cli.fec_max_overhead != 25 {
+            cli.fec_max_overhead
+        } else {
+            config.tunnel.fec_max_overhead_pct
+        },
+        ..AdaptiveConfig::default()
+    };
+
+    // ── Telemetry (on by default, opt-out) ────────────────────────
+    //
+    // Anonymous aggregate latency stats only: no IP address, token, or user
+    // identifier is ever sent. Disable with --no-telemetry or
+    // `telemetry = false` in lightspeed.toml. See docs/privacy.md.
+    let telemetry_collector: Option<Arc<TelemetryCollector>> = if telemetry_enabled(&cli, &config) {
+        telemetry::print_notice();
+        Some(Arc::new(telemetry::install()))
+    } else {
+        None
+    };
+
+    // Local latency measurement is independent of telemetry reporting: the
+    // interceptor/tunnel needs it for routing, so install it whether or not
+    // reporting is enabled. Nothing measured reaches the relay unless reporting
+    // is on (enforced in telemetry::TelemetryCollector::flush).
+    latency::install_measurement();
+
+    // ── Do-no-harm bypass gate ────────────────────────────────────
+    //
+    // Default is dry_run: measure and log the decision, change nothing. It is
+    // only raised to `auto` by an explicit setting, and on Linux/macOS that
+    // still means "do not install the redirect" rather than a live teardown.
+    let bypass_config = resolved_bypass_config(&cli, &config);
+    if bypass_config.mode == interceptor::bypass::BypassMode::DryRun {
+        info!("🛡️  Bypass gate: dry_run (measuring and logging only; tunneling unchanged)");
+    } else {
+        info!("🛡️  Bypass gate mode: {}", bypass_config.mode.as_str());
+    }
+    interceptor::bypass::set_default_config(bypass_config);
+
+    let _token_reset = TokenResetOnShutdown;
+
+    // ── Transport selection (UDP default, TCP opt-in) ─────────────
+    let use_tcp = cli.tcp || config.tunnel.transport.eq_ignore_ascii_case("tcp");
+    if use_tcp {
+        info!("🌐 TCP tunnel transport enabled");
+    }
+
+    // ── DSCP marking (opt-in, off by default) ─────────────────────
+    //
+    // Only the player's local hop may honour DSCP; later hops and the proxy
+    // side are unmarked. Windows ignores IP_TOS without QWAVE/QoS2.
+    let use_dscp = cli.dscp || config.tunnel.dscp;
+    tunnel::qos::set_enabled(use_dscp);
+    if use_dscp {
+        info!("🏷️  DSCP EF (46) marking enabled for tunnel packets");
+    }
+
+    // ── Cloudflare WARP manager (used by several early-exit paths) ─
+    let mut warp_manager = warp::WarpManager::new();
+
+    // ── --warp-status: show WARP info and exit ────────────────────
+    //
+    // Must run BEFORE game auto-detection to avoid a spurious
+    // "No supported game detected" warning and the ~300 ms tasklist scan.
+    if cli.warp_status {
+        if !warp_manager.is_installed() {
+            info!("🌐 Cloudflare WARP: Not installed");
+            info!("   Install: {}", warp::install_instructions());
+        } else {
+            let warp_info = warp_manager.info();
+            info!("🌐 Cloudflare WARP Status");
+            info!("   Status:   {}", warp_info.status);
+            info!(
+                "   Protocol: {}",
+                warp_info.protocol.unwrap_or_else(|| "unknown".into())
+            );
+            info!(
+                "   Mode:     {}",
+                warp_info.mode.unwrap_or_else(|| "unknown".into())
+            );
+            // Read proxy IPs from config or env var, with placeholder fallback for testing
+            let proxy_ips = if let Ok(ips_str) = std::env::var("LIGHTSPEED_PROXY_IPS") {
+                ips_str
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect()
+            } else {
+                vec![
+                    Ipv4Addr::new(104, 26, 1, 50), // Example public IP for testing
+                ]
+            };
+            warp_manager.print_summary(&proxy_ips);
+            if let Some(stats) = warp_manager.tunnel_stats() {
+                info!("   Tunnel stats:\n{}", stats);
+            }
+        }
+        return Ok(());
+    }
+
+    // ── No-mode banner ────────────────────────────────────────────
+    //
+    // When no mode flags are provided, show a friendly quick-start
+    // instead of falling through to the default keepalive loop.
+    {
+        let has_mode = cli.list_games
+            || cli.list_interfaces
+            || cli.write_config
+            || cli.check
+            || cli.demo
+            || cli.intercept
+            || cli.scan_processes
+            || cli.start_interceptor
+            || cli.test_tunnel
+            || cli.test_control
+            || cli.probe_proxies
+            || cli.live_test
+            || cli.warp_status
+            || cli.dry_run
+            || cli.capture
+            || cli.game_server.is_some()
+            || cli.game.is_some()
+            || cli.smoke_test
+            || cli.watch
+            || cli.benchmark
+            || cli.diagnose
+            || cli.status
+            || cli.verify_game.is_some()
+            || cli.interception_mode.is_some();
+        if !has_mode {
+            info!("╔════════════════════════════════════════════╗");
+            info!(
+                "║       ⚡  LightSpeed v{}                  ║",
+                env!("CARGO_PKG_VERSION")
+            );
+            info!("║   Zero-cost global network optimizer      ║");
+            info!("╠════════════════════════════════════════════╣");
+            info!("║  Quick start:                             ║");
+            info!("║    lightspeed --demo                      ║");
+            info!("║    lightspeed --check --game rust          ║");
+            info!("║    lightspeed --list-games                ║");
+            info!("║    lightspeed --help                      ║");
+            info!("╚════════════════════════════════════════════╝");
+            return Ok(());
+        }
+    }
+
+    // ── --list-interfaces ─────────────────────────────────────────
+    //
+    // Also runs before game detection - no point scanning processes
+    // when the user only wants to list NICs.
+    if cli.list_interfaces {
+        info!("🔌 Available network interfaces:");
+        let interfaces = capture::list_interfaces();
+        if interfaces.is_empty() {
+            info!("   (none found - pcap-capture feature may not be enabled)");
+            info!("   Rebuild with: cargo build --features pcap-capture");
+        } else {
+            for iface in &interfaces {
+                let status = if iface.is_up { "UP" } else { "DOWN" };
+                let kind = if iface.is_loopback { " (loopback)" } else { "" };
+                info!(
+                    "   • {} [{}]{} - {}",
+                    iface.name, status, kind, iface.description
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // ── --list-games ──────────────────────────────────────────────
+    if cli.list_games {
+        let builtins: Vec<String> = games::all_games()
+            .into_iter()
+            .map(|game| {
+                let (lo, hi) = game.ports();
+                format!(
+                    "   {:<12} ports {}-{} - {}",
+                    game.name(),
+                    lo,
+                    hi,
+                    game.process_names().join(", ")
+                )
+            })
+            .collect();
+        let source = profile_store.path();
+        let profiles = profile_store.games();
+        for line in profiles::render_list_games(&builtins, &profiles, source.as_deref()) {
+            info!("{}", line);
+        }
+        return Ok(());
+    }
+
+    // ── --write-config ────────────────────────────────────────────
+    if cli.write_config {
+        let path = "lightspeed.toml";
+        if std::path::Path::new(path).exists() {
+            warn!("{} already exists - not overwriting", path);
+        } else {
+            std::fs::write(path, EXAMPLE_CONFIG)?;
+            info!("📝 Wrote default config to {}", path);
+            info!("   Edit {} to set your proxy addresses, then run:", path);
+            info!("   lightspeed --game rust");
+        }
+        return Ok(());
+    }
+
+    // ── --benchmark ──────────────────────────────────────────
+    if cli.benchmark {
+        let target_str = cli
+            .target
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--benchmark requires --target <ip:port>"))?;
+        let target_addr = parse_proxy_addr(target_str)?;
+        let proxy_str = cli.proxy.as_deref().unwrap_or("127.0.0.1:4434");
+        let proxy_addr = parse_proxy_addr(proxy_str)?;
+        crate::quic::register_session_with_destination(
+            proxy_addr,
+            config.proxy.quic_port,
+            Some(*target_addr.ip()),
+        )
+        .await;
+        return run_benchmark(target_addr, proxy_addr).await;
+    }
+
+    // ── --diagnose ─────────────────────────────────────────────
+    //
+    // Self-contained "does LightSpeed help me?" report for one server. No
+    // telemetry is built or sent; it degrades to "not enough samples" rather
+    // than guessing.
+    if cli.diagnose {
+        let server = resolve_diagnose_server(&cli)?;
+        let resolved = resolve_proxy_addr(&cli, &config).await?;
+        let proxy_addr = resolved.addr;
+        info!("🔎 Diagnosing {} via {}", server, proxy_addr);
+        let token = crate::quic::register_session_with_destination(
+            proxy_addr,
+            config.proxy.quic_port,
+            Some(*server.ip()),
+        )
+        .await;
+        if token.is_none() {
+            warn!("   No session token; relayed probes may be dropped. The verdict will say so.");
+        }
+        return run_diagnose(server, proxy_addr, DEFAULT_WINDOW).await;
+    }
+
+    // ── --watch ───────────────────────────────────────────────
+    if cli.watch {
+        let game_key = cli
+            .game
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--watch requires --game <name>"))?;
+        let resolved = resolve_proxy_addr(&cli, &config).await?;
+        let proxy_addr = resolved.addr;
+        let server_override = cli
+            .server_addr
+            .as_deref()
+            .map(parse_proxy_addr)
+            .transpose()?;
+        crate::quic::register_session_with_destination(
+            proxy_addr,
+            config.proxy.quic_port,
+            known_game_server(&cli),
+        )
+        .await;
+        crate::session::set_current_proxy(proxy_addr);
+        start_continuous_rerouting(&resolved.candidates, &config, &cli);
+        spawn_session_telemetry_flush(&telemetry_collector, proxy_addr, game_key);
+        return run_watch_mode(
+            game_key,
+            proxy_addr,
+            cli.fec,
+            cli.fec_k,
+            adaptive_cfg,
+            server_override,
+        )
+        .await;
+    }
+
+    // ── --smoke-test ───────────────────────────────────────────
+    if cli.smoke_test {
+        let proxy_str = cli.proxy.as_deref().unwrap_or("127.0.0.1:4434");
+        let proxy_addr = parse_proxy_addr(proxy_str)?;
+        info!("🔥 Running E2E smoke test (needs root for nftables)...");
+        crate::quic::register_session(proxy_addr, config.proxy.quic_port).await;
+        return run_smoke_test(proxy_addr).await;
+    }
+
+    // ── --demo ──────────────────────────────────────────────────
+    if cli.demo {
+        let game_key = cli.game.as_deref().unwrap_or("rust");
+        let proxy_str = cli.proxy.as_deref().unwrap_or("127.0.0.1:4434");
+        let proxy_addr = parse_proxy_addr(proxy_str)?;
+        crate::quic::register_session(proxy_addr, config.proxy.quic_port).await;
+        return run_demo(&config, game_key, proxy_str).await;
+    }
+
+    // ── --status ─────────────────────────────────────────────────
+    if cli.status {
+        info!("📊 LightSpeed System Status");
+        info!("   Version:    v{}", env!("CARGO_PKG_VERSION"));
+        info!("   OS:         {}", std::env::consts::OS);
+        info!("   Arch:       {}", std::env::consts::ARCH);
+        {
+            let mut feats = Vec::new();
+            if cfg!(feature = "ml") {
+                feats.push("ml");
+            }
+            if cfg!(feature = "quic") {
+                feats.push("quic");
+            }
+            if cfg!(feature = "pcap-capture") {
+                feats.push("pcap-capture");
+            }
+            if cfg!(feature = "windivert-redirect") {
+                feats.push("windivert-redirect");
+            }
+            let fstr = if feats.is_empty() {
+                String::from("none")
+            } else {
+                feats.join(" ")
+            };
+            info!("   Features:   {}", fstr);
+        }
+        info!("");
+
+        // Interceptor
+        let interceptor = lightspeed_client::interceptor::create_interceptor();
+        let platform = interceptor.platform_name();
+        let avail = interceptor.check_availability();
+        info!(
+            "   Interceptor: {} ({})",
+            platform,
+            if avail.is_ok() {
+                "✅ available"
+            } else {
+                "❌ unavailable"
+            }
+        );
+        if let Err(e) = &avail {
+            info!("     {}", e);
+        }
+        info!("");
+
+        // Root
+        #[cfg(target_os = "linux")]
+        {
+            let is_root = std::process::Command::new("id")
+                .args(["-u"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .map(|uid| uid == 0)
+                .unwrap_or(false);
+            info!(
+                "   Root:        {}",
+                if is_root {
+                    "✅ yes"
+                } else {
+                    "⚠️  no (needed for nftables)"
+                }
+            );
+        }
+        info!("");
+
+        // Games
+        if let Some(ref g) = cli.game {
+            match games::resolve(g) {
+                Ok(game) => {
+                    let found =
+                        interceptor::process_scanner::find_game_process(&game.process_names());
+                    info!("   Game:        {}", game.name());
+                    info!("   Ports:       {}-{}", game.ports().0, game.ports().1);
+                    match found {
+                        Some(p) => info!(
+                            "   Status:      🟢 Running (PID {}, {} routes)",
+                            p.pid,
+                            p.routes.len()
+                        ),
+                        None => info!("   Status:      ⚪ Not running"),
+                    }
+                }
+                Err(_) => info!("   Game:        {} (unknown)", g),
+            }
+        } else {
+            // Scan all games
+            let all: &[&str] = &[
+                "RustClient.exe",
+                "FortniteClient-Win64-Shipping.exe",
+                "cs2.exe",
+                "dota2.exe",
+                "r5apex.exe",
+                "VALORANT-Win64-Shipping.exe",
+            ];
+            let found = interceptor::process_scanner::scan_for_games(all);
+            if found.is_empty() {
+                info!("   Games:       none running");
+            } else {
+                info!("   Games running:");
+                for p in &found {
+                    info!("     {} (PID {}, {} routes)", p.name, p.pid, p.routes.len());
+                }
+            }
+        }
+        info!("");
+
+        // nftables rules
+        #[cfg(target_os = "linux")]
+        {
+            let nft = std::process::Command::new("nft")
+                .args(["list", "tables"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            let ls_rules: Vec<&str> = nft.lines().filter(|l| l.contains("lightspeed_")).collect();
+            if ls_rules.is_empty() {
+                info!("   nftables:    no LightSpeed rules");
+            } else {
+                info!("   nftables rules:");
+                for r in &ls_rules {
+                    info!("     {}", r.trim());
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // ── --check ──────────────────────────────────────────────────
+    if cli.check {
+        info!("🔍 LightSpeed environment check");
+        let mut all_ok = true;
+
+        // 1. Interceptor availability
+        let interceptor = interceptor::create_interceptor();
+        let platform = interceptor.platform_name();
+        match interceptor.check_availability() {
+            Ok(()) => info!("   ✅ Interceptor backend: {} - available", platform),
+            Err(e) => {
+                warn!("   ❌ Interceptor backend: {} - {}", platform, e);
+                all_ok = false;
+            }
+        }
+
+        // 2. Root / admin check
+        #[cfg(target_os = "linux")]
+        {
+            let is_root = std::process::Command::new("id")
+                .args(["-u"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .map(|uid| uid == 0)
+                .unwrap_or(false);
+            if is_root {
+                info!("   ✅ Running as root");
+            } else {
+                warn!("   ⚠️  Not running as root - interceptor needs sudo");
+            }
+        }
+
+        // 3. Game detection
+        if let Some(ref game_name) = cli.game {
+            match games::resolve(game_name) {
+                Ok(game) => {
+                    let procs = game.process_names();
+                    let found = crate::interceptor::process_scanner::find_game_process(&procs);
+                    match found {
+                        Some(p) => info!(
+                            "   ✅ Game '{}' detected: PID {} with {} routes",
+                            game.name(),
+                            p.pid,
+                            p.routes.len()
+                        ),
+                        None => info!(
+                            "   ⚠️  Game '{}' not running - port-range fallback will be used",
+                            game.name()
+                        ),
+                    }
+                }
+                Err(_) => {
+                    warn!("   ❌ Unknown game '{}'", game_name);
+                    all_ok = false;
+                }
+            }
+        } else {
+            info!("   ℹ️  No --game specified - skipping game detection");
+        }
+
+        // 4. Proxy reachability (quick UDP probe)
+        if let Some(ref proxy_str) = cli.proxy {
+            let proxy_addr = match parse_proxy_addr(proxy_str) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("   ❌ Invalid proxy address '{}': {}", proxy_str, e);
+                    all_ok = false;
+                    return if all_ok {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("Some checks failed"))
+                    };
+                }
+            };
+            // Quick connectivity check: send a keepalive and wait for the
+            // proxy's echo. A bare `send_to` success is meaningless for UDP
+            // (connectionless), so a dead proxy would otherwise pass.
+            let probe = || -> Result<u128, String> {
+                let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+                sock.set_read_timeout(Some(std::time::Duration::from_millis(1000)))
+                    .map_err(|e| e.to_string())?;
+                let hdr = lightspeed_protocol::TunnelHeader::keepalive(1, 0)
+                    .with_session_token(crate::session::session_token());
+                let started = std::time::Instant::now();
+                sock.send_to(&hdr.encode_to_array(), proxy_addr)
+                    .map_err(|e| e.to_string())?;
+                let mut buf = [0u8; 512];
+                match sock.recv_from(&mut buf) {
+                    Ok(_) => Ok(started.elapsed().as_millis()),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            match probe() {
+                Ok(ms) => info!("   ✅ Proxy {} - reachable (echo {}ms)", proxy_addr, ms),
+                Err(e) => {
+                    warn!("   ❌ Proxy {} - no echo within 1s ({})", proxy_addr, e);
+                    all_ok = false;
+                }
+            }
+        } else {
+            info!("   ℹ️  No --proxy specified - skipping proxy check");
+        }
+
+        if all_ok {
+            info!("✅ All checks passed");
+        } else {
+            warn!("❌ Some checks failed - see above");
+            return Err(anyhow::anyhow!("Some checks failed"));
+        }
+        return Ok(());
+    }
+
+    // ── --scan-processes ──────────────────────────────────────────
+    if cli.scan_processes {
+        info!("🔍 Scanning for game processes...");
+        use interceptor::process_scanner;
+        let game_names: Vec<String> = if let Some(ref g) = cli.game {
+            match games::resolve(g) {
+                Ok(boxed) => boxed
+                    .process_names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                Err(e) => {
+                    error!("Unknown game: {}", e);
+                    return Err(e);
+                }
+            }
+        } else {
+            // Scan for all known games
+            vec![
+                "RustClient.exe".into(),
+                "FortniteClient-Win64-Shipping.exe".into(),
+                "cs2.exe".into(),
+                "dota2.exe".into(),
+                "r5apex.exe".into(),
+                "VALORANT-Win64-Shipping.exe".into(),
+            ]
+        };
+        let game_name_refs: Vec<&str> = game_names.iter().map(|s| s.as_str()).collect();
+        let results = process_scanner::scan_for_games(&game_name_refs);
+        if results.is_empty() {
+            info!("   No matching game processes found.");
+        } else {
+            for p in &results {
+                info!("   PID {} ({}) - {} routes:", p.pid, p.name, p.routes.len());
+                for r in &p.routes {
+                    info!("      {} → {}", r.local, r.remote);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // ── --intercept ───────────────────────────────────────────────
+    if cli.intercept {
+        info!("🧪 Interceptor diagnostic mode");
+        let interceptor = interceptor::create_interceptor();
+        info!("   Platform: {}", interceptor.platform_name());
+
+        match interceptor.check_availability() {
+            Ok(()) => info!("   Availability: ✅ Ready"),
+            Err(e) => {
+                warn!("   Availability: ❌ {}", e);
+                return Ok(());
+            }
+        }
+
+        // If game specified, try to build config and show routes
+        if let Some(ref game_name) = cli.game {
+            match games::resolve(game_name) {
+                Ok(game) => {
+                    let proxy = cli.proxy.as_deref().unwrap_or("127.0.0.1:4434");
+                    let proxy_addr = match parse_proxy_addr(proxy) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            warn!("   Invalid proxy address '{}': {}", proxy, e);
+                            return Err(e);
+                        }
+                    };
+
+                    let config_opt = interceptor::build_config_for_game(
+                        game.as_ref(),
+                        proxy_addr,
+                        cli.fec,
+                        cli.fec_k,
+                        adaptive_cfg,
+                    );
+
+                    match config_opt {
+                        Some(cfg) => {
+                            info!("   Game: {}", cfg.game_name);
+                            info!("   Process target: {:?}", cfg.process_target);
+                            info!("   Port range: {}-{}", cfg.port_range.0, cfg.port_range.1);
+                            info!("   Routes discovered: {}", cfg.initial_routes.len());
+                            for r in &cfg.initial_routes {
+                                info!("      {} → {}", r.local, r.remote);
+                            }
+                            if cfg.initial_routes.is_empty() {
+                                info!("   (No server routes found - game may need to be connected to a server)");
+                            }
+                        }
+                        None => {
+                            warn!("   Could not build interceptor config - see logs above.");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("   Unknown game '{}': {}", game_name, e);
+                }
+            }
+        } else {
+            info!("   (specify --game <name> to scan for a specific game's routes)");
+        }
+
+        return Ok(());
+    }
+
+    // ── --verify-game ─────────────────────────────────────────────
+    if let Some(key) = cli.verify_game.clone() {
+        let proxy = match resolve_proxy_addr(&cli, &config).await {
+            Ok(resolved) => Some(resolved.addr),
+            Err(error) => {
+                warn!("   No relay resolved, live stage skipped: {error}");
+                None
+            }
+        };
+        let path = cli.verify_report.as_deref().map(std::path::Path::new);
+        let verdict =
+            crate::modes::verify_game::run_verify_game(&key, proxy, cli.verify_seconds, path)
+                .await?;
+        if verdict.is_fail() {
+            anyhow::bail!("game verification failed for '{key}'");
+        }
+        return Ok(());
+    }
+
+    // ── --start-interceptor ────────────────────────────────────────
+    if cli.start_interceptor {
+        let game_key = cli
+            .game
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--start-interceptor requires --game <name>"))?;
+        let resolved = resolve_proxy_addr(&cli, &config).await?;
+        let proxy_addr = resolved.addr;
+
+        info!("🚀 Starting live interceptor mode");
+        let server_override = match cli.server_addr.as_deref() {
+            Some(s) => Some(parse_proxy_addr(s)?),
+            None => None,
+        };
+        crate::quic::register_session_with_destination(
+            proxy_addr,
+            config.proxy.quic_port,
+            known_game_server(&cli),
+        )
+        .await;
+        crate::session::set_current_proxy(proxy_addr);
+        start_continuous_rerouting(&resolved.candidates, &config, &cli);
+        spawn_session_telemetry_flush(&telemetry_collector, proxy_addr, game_key);
+        return run_intercept_mode(
+            game_key,
+            proxy_addr,
+            cli.fec,
+            cli.fec_k,
+            adaptive_cfg,
+            server_override,
+        )
+        .await;
+    }
+
+    // ── Game detection ────────────────────────────────────────────
+    let game: Option<Box<dyn games::GameConfig>> = match cli.game.as_deref() {
+        Some(name) => {
+            info!("Game selected: {}", name);
+            Some(games::resolve(name)?)
+        }
+        None => {
+            if cli.game_server.is_some() {
+                info!("Redirect mode - game detection skipped");
+                None
+            } else {
+                info!("Auto-detecting running game...");
+                match games::auto_detect() {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        warn!("{}", e);
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    if let Some(ref game) = game {
+        info!(
+            "🎮 Targeting game: {} (ports: {:?})",
+            game.name(),
+            game.ports()
+        );
+    }
+
+    // ── --dry-run ─────────────────────────────────────────────────
+    if cli.dry_run {
+        info!("Dry run mode - showing configuration and exiting");
+        info!("Config: {:?}", config);
+        if let Some(ref game) = game {
+            info!("Game: {}", game.name());
+        }
+        return Ok(());
+    }
+
+    // ── Cloudflare WARP integration ───────────────────────────────
+    //
+    // WARP routes traffic through Cloudflare's NTT backbone, bypassing
+    // ISP routing inefficiencies. Free 5-10 ms improvement on most paths.
+
+    if cli.warp && !cli.no_warp {
+        if !warp_manager.is_installed() {
+            warn!("🌐 WARP requested but not installed!");
+            warn!("   Install Cloudflare WARP for 5-10ms latency improvement:");
+            warn!("   {}", warp::install_instructions());
+            warn!("   Continuing without WARP...");
+        } else {
+            match warp_manager.connect() {
+                Ok(()) => {
+                    info!("🌐 WARP enabled - traffic routed through Cloudflare NTT backbone");
+                }
+                Err(e) => {
+                    warn!("🌐 WARP connection failed: {}", e);
+                    warn!("   Continuing without WARP...");
+                }
+            }
+        }
+    } else if !cli.no_warp {
+        match warp_manager.status() {
+            warp::WarpStatus::Connected => {
+                info!("🌐 WARP detected and connected - traffic uses NTT backbone");
+            }
+            warp::WarpStatus::Disconnected => {
+                info!("🌐 WARP installed but disconnected. Use --warp to enable (saves 5-10ms)");
+            }
+            warp::WarpStatus::NotInstalled => {}
+            _ => {}
+        }
+    }
+
+    // ── --probe-proxies ───────────────────────────────────────────
+    //
+    // Self-contained probe: build the labeled candidate list (configured
+    // proxies + registry nodes), fetch the registry once, probe once, print a
+    // report, and exit. It runs before `resolve_proxy_addr`/reroute setup so a
+    // probe never mutates global session state or spawns background tasks.
+    if cli.probe_proxies {
+        let mut candidates: Vec<ProbeCandidate> = config
+            .proxy
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    format!("configured-{}", i),
+                    s.clone(),
+                    "unknown".to_string(),
+                )
+            })
+            .collect();
+
+        let registry_url = cli
+            .registry
+            .as_deref()
+            .or(config.registry.url.as_deref())
+            .unwrap_or(crate::registry::DEFAULT_REGISTRY_URL);
+        let operator_key = config
+            .registry
+            .operator_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .unwrap_or(crate::registry::DEFAULT_OPERATOR_PUBKEY_B64);
+        match crate::registry::discover_relays(registry_url, operator_key, config.proxy.quic_port) {
+            Ok(relays) if !relays.is_empty() => {
+                info!("🔍 Registry: {} relay(s) discovered", relays.len());
+                candidates.extend(
+                    relays
+                        .into_iter()
+                        .map(|relay| (relay.node_id, relay.addr, relay.region)),
+                );
+            }
+            Ok(_) => warn!("Registry returned no relays"),
+            Err(e) => warn!("Registry fetch failed: {e}"),
+        }
+
+        if candidates.is_empty() {
+            warn!("No proxies configured or discovered");
+        } else {
+            info!("🔍 Probing {} proxy candidate(s)...", candidates.len());
+            let probes =
+                probe_labeled(&candidates, config.proxy.data_port, config.proxy.quic_port).await;
+            // Plain-text report on stdout so it is visible even when the log
+            // filter hides the INFO target.
+            println!("📊 Proxy Latency Report:");
+            info!("📊 Proxy Latency Report:");
+            for node in &probes {
+                let status = match node.health {
+                    ProxyHealth::Healthy => "healthy",
+                    ProxyHealth::Degraded => "degraded",
+                    ProxyHealth::Unhealthy => "unhealthy",
+                    ProxyHealth::Unknown => "unknown",
+                };
+                let latency = node
+                    .latency_us
+                    .map(|us| format!("{:.1}ms", us as f64 / 1000.0))
+                    .unwrap_or_else(|| "timeout".into());
+                println!(
+                    "   {} {} ({}) - {}",
+                    status, node.id, node.data_addr, latency
+                );
+                info!(
+                    "   {} {} ({}) - {}",
+                    status, node.id, node.data_addr, latency
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // ── Proxy selection (explicit → auto-select → default) ────────
+    let resolved = resolve_proxy_addr(&cli, &config).await?;
+    let proxy_addr = resolved.addr;
+    crate::session::set_current_proxy(proxy_addr);
+    start_continuous_rerouting(&resolved.candidates, &config, &cli);
+
+    // ── Telemetry context + periodic flush (all session modes) ────
+    //
+    // Spawned before mode dispatch so redirect, capture, and interceptor
+    // sessions report too, not just keepalive mode. The context is kept for
+    // keepalive mode's final shutdown flush.
+    let game_id = cli
+        .game
+        .as_deref()
+        .map(lightspeed_protocol::game_id::id_for_key)
+        .unwrap_or(lightspeed_protocol::game_id::UNKNOWN);
+    let telemetry_ctx = telemetry::context::TelemetryContext {
+        game_id,
+        country: telemetry::context::detect_country(),
+    };
+    if let Some(ref tc) = telemetry_collector {
+        // `flush` appends `:8080` itself, so pass the bare relay IP only.
+        let proxy_host = proxy_addr.ip().to_string();
+        telemetry::spawn_periodic_flush(
+            tc.as_ref().clone(),
+            proxy_host,
+            Some(proxy_addr),
+            telemetry_ctx.clone(),
+        );
+    }
+
+    // ── --live-test ───────────────────────────────────────────────
+    if cli.live_test {
+        let echo_server = cli
+            .echo_server
+            .as_ref()
+            .and_then(|s| parse_proxy_addr(s).ok());
+        crate::quic::register_session_with_destination(
+            proxy_addr,
+            config.proxy.quic_port,
+            echo_server.map(|addr| *addr.ip()),
+        )
+        .await;
+        return run_live_test(&config, Some(proxy_addr), echo_server, cli.fec, cli.fec_k).await;
+    }
+
+    // ── Relay socket (shared by tunnel/control tests + keepalive) ─
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+    let mut relay = UdpRelay::new(bind_addr);
+    if adaptive_cfg.enabled {
+        info!(
+            "Adaptive FEC: on (K={}, overhead ceiling {}%)",
+            adaptive_cfg.effective_k(),
+            adaptive_cfg.overhead_pct()
+        );
+        relay = relay.with_adaptive_fec(adaptive_cfg);
+    }
+    let pmtud_enabled = cli.path_mtu_discovery || config.tunnel.path_mtu_discovery;
+    if pmtud_enabled {
+        info!(
+            "Client-to-relay path-MTU discovery: on (hard cap {} bytes)",
+            crate::tunnel::pmtud::HARD_CAP_PATH_MTU
+        );
+    }
+    relay = relay.with_pmtud(pmtud_enabled);
+    if use_tcp {
+        relay.connect_tcp(proxy_addr).await?;
+    } else {
+        relay.bind().await?;
+    }
+
+    // ── --test-tunnel ─────────────────────────────────────────────
+    if cli.test_tunnel {
+        crate::quic::register_session(proxy_addr, config.proxy.quic_port).await;
+        return run_tunnel_test(relay, proxy_addr).await;
+    }
+
+    // ── --test-control ────────────────────────────────────────────
+    if cli.test_control {
+        return run_control_test(proxy_addr, &config).await;
+    }
+
+    crate::quic::register_session(proxy_addr, config.proxy.quic_port).await;
+
+    // ── Online learner ────────────────────────────────────────────
+    //
+    // Collects live RTT data from keepalive probes and retrains the
+    // route model when enough new data accumulates.
+    let (proxy_id, proxy_region) = if let Some(id) = std::env::var("LIGHTSPEED_PROXY_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        (
+            id,
+            std::env::var("LIGHTSPEED_PROXY_REGION").unwrap_or_else(|_| "unknown".to_string()),
+        )
+    } else {
+        (format!("proxy-{}", proxy_addr.ip()), "unknown".to_string())
+    };
+
+    let online_learner = {
+        let mut learner = ml::online::OnlineLearner::new();
+        match learner.initialize() {
+            Ok(()) => {
+                let summary = learner.summary();
+                info!(
+                    "🧠 Online learning initialized: {} previous measurements, model: {}",
+                    summary.total_measurements, summary.model_version,
+                );
+            }
+            Err(e) => warn!("🧠 Online learning init failed (non-fatal): {}", e),
+        }
+        Arc::new(tokio::sync::Mutex::new(learner))
+    };
+
+    let keepalive_timestamps: Arc<tokio::sync::Mutex<HashMap<u16, std::time::Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    // ── --game-server: redirect mode ──────────────────────────────
+    //
+    // Game → localhost:port → LightSpeed → Proxy → Game Server
+    if let Some(ref server_str) = cli.game_server {
+        let game_server_addr = parse_proxy_addr(server_str)?;
+        let local_port = cli.local_port.unwrap_or_else(|| {
+            if let Some(ref game) = game {
+                game.redirect_port()
+            } else {
+                game_server_addr.port()
+            }
+        });
+
+        info!("🚀 Starting redirect mode");
+        if let Some(ref game) = game {
+            info!(
+                "   Game:        {} (anti-cheat: {})",
+                game.name(),
+                game.anti_cheat()
+            );
+            info!("   Typical PPS: ~{} packets/sec", game.typical_pps());
+        }
+        info!("   Game server: {}", game_server_addr);
+        info!("   Local port:  127.0.0.1:{}", local_port);
+        info!("   Proxy:       {}", proxy_addr);
+
+        let mut redirect_proxy =
+            redirect::UdpRedirect::new(local_port, game_server_addr, proxy_addr);
+        if adaptive_cfg.enabled {
+            info!(
+                "   FEC:         adaptive (K={}, ceiling {}%)",
+                adaptive_cfg.effective_k(),
+                adaptive_cfg.overhead_pct()
+            );
+            redirect_proxy = redirect_proxy.with_adaptive_fec(adaptive_cfg);
+        } else if cli.fec {
+            info!(
+                "   FEC:         enabled (K={}, ~{}% overhead)",
+                cli.fec_k,
+                100 / cli.fec_k as u32
+            );
+            redirect_proxy = redirect_proxy.with_fec(cli.fec_k);
+        }
+        if use_tcp {
+            redirect_proxy = redirect_proxy.with_tcp();
+        }
+        crate::quic::register_session_with_destination(
+            proxy_addr,
+            config.proxy.quic_port,
+            Some(*game_server_addr.ip()),
+        )
+        .await;
+        return redirect_proxy.run().await;
+    }
+
+    // ── --capture: pcap mode ──────────────────────────────────────
+    if cli.capture {
+        let game_ref = game.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Capture mode requires a game. Use --game <name> or ensure a game is running."
+            )
+        })?;
+        return run_capture_mode(
+            game_ref.as_ref(),
+            proxy_addr,
+            proxy_id,
+            proxy_region,
+            online_learner,
+            keepalive_timestamps,
+            cli.fec,
+            cli.fec_k,
+            cli.interface,
+        )
+        .await;
+    }
+
+    // ── Interception-mode-driven backend selection ────────────────
+    //
+    // When the effective mode is explicitly `kernel` or `userspace`, route
+    // the default game path to that backend. `auto` (the default) preserves
+    // the pre-existing behavior and falls through to keepalive mode below.
+    let interception_mode =
+        effective_interception_mode(cli.interception_mode.as_deref(), &config.interception.mode)
+            .map_err(anyhow::Error::msg)?;
+
+    match interception_mode {
+        InterceptionMode::Kernel | InterceptionMode::Userspace => {
+            let game_ref = game.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Interception mode requires a game. Use --game <name> or ensure a game is running."
+                )
+            })?;
+            let (kernel_available, userspace_available) = interceptor::probe_availability();
+            match interceptor::resolve_mode(
+                interception_mode,
+                kernel_available,
+                userspace_available,
+            )
+            .map_err(anyhow::Error::msg)?
+            {
+                ResolvedMode::Kernel => {
+                    info!("🚀 Starting live interceptor mode (kernel)");
+                    crate::quic::register_session_with_destination(
+                        proxy_addr,
+                        config.proxy.quic_port,
+                        known_game_server(&cli),
+                    )
+                    .await;
+                    crate::session::set_current_proxy(proxy_addr);
+                    start_continuous_rerouting(&resolved.candidates, &config, &cli);
+                    return run_intercept_mode(
+                        game_ref.name(),
+                        proxy_addr,
+                        cli.fec,
+                        cli.fec_k,
+                        adaptive_cfg,
+                        None,
+                    )
+                    .await;
+                }
+                ResolvedMode::Userspace => {
+                    info!("🚀 Starting userspace pcap capture mode");
+                    return run_capture_mode(
+                        game_ref.as_ref(),
+                        proxy_addr,
+                        proxy_id,
+                        proxy_region,
+                        online_learner,
+                        keepalive_timestamps,
+                        cli.fec,
+                        cli.fec_k,
+                        cli.interface.clone(),
+                    )
+                    .await;
+                }
+            }
+        }
+        InterceptionMode::Auto => {}
+    }
+
+    // ── Game setup instructions ───────────────────────────────────
+    if let Some(ref game) = game {
+        info!("📋 {} setup instructions:", game.name());
+        for line in game.redirect_instructions().lines() {
+            info!("   {}", line);
+        }
+        info!("");
+        info!(
+            "   Example: lightspeed --game {} --game-server <SERVER_IP>:{} --proxy {}",
+            cli.game.as_deref().unwrap_or("unknown"),
+            game.redirect_port(),
+            proxy_addr,
+        );
+        info!("");
+    }
+
+    // ── Keepalive mode ────────────────────────────────────────────
+    run_keepalive_mode(
+        relay,
+        proxy_addr,
+        proxy_id,
+        proxy_region,
+        online_learner,
+        keepalive_timestamps,
+        telemetry_collector,
+        telemetry_ctx,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::telemetry_enabled;
+    use crate::cli::Cli;
+    use crate::config::Config;
+    use clap::Parser;
+
+    fn cli_with(telemetry: bool, no_telemetry: bool) -> Cli {
+        let mut cli = Cli::try_parse_from(["lightspeed"]).unwrap();
+        cli.telemetry = telemetry;
+        cli.no_telemetry = no_telemetry;
+        cli
+    }
+
+    #[test]
+    fn telemetry_runs_by_default() {
+        assert!(telemetry_enabled(
+            &cli_with(false, false),
+            &Config::default()
+        ));
+    }
+
+    #[test]
+    fn config_opt_out_disables_telemetry() {
+        let mut config = Config::default();
+        config.general.telemetry = false;
+        assert!(!telemetry_enabled(&cli_with(false, false), &config));
+    }
+
+    #[test]
+    fn cli_flag_forces_telemetry_on_over_config() {
+        let mut config = Config::default();
+        config.general.telemetry = false;
+        assert!(telemetry_enabled(&cli_with(true, false), &config));
+    }
+
+    #[test]
+    fn no_telemetry_is_a_hard_override() {
+        assert!(!telemetry_enabled(
+            &cli_with(true, true),
+            &Config::default()
+        ));
+        let mut config = Config::default();
+        config.general.telemetry = true;
+        assert!(!telemetry_enabled(&cli_with(false, true), &config));
+    }
+}

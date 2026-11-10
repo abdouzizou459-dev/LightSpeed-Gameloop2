@@ -1,0 +1,10 @@
+# cargo-audit configuration for LightSpeed
+# Advisories acknowledged and accepted pending dependency upgrades.
+# Review periodically.
+
+[advisories]
+ignore = [
+    # protobuf 2.x uncontrolled recursion -- transitive via prometheus.
+    # No user-controlled protobuf parsing in our attack surface.
+    "RUSTSEC-2024-0437",
+]

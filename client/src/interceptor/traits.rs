@@ -1,0 +1,784 @@
+//! Core OOP trait + supporting types for the TrafficInterceptor framework.
+//!
+//! Every platform (Windows WinDivert, Linux nftables, macOS pf) implements
+//! `TrafficInterceptor` so the engine can drive them through a single interface.
+//!
+//! ## Design goals
+//!
+//! - **Zero ongoing cost**: All implementations use OS-native free tools.
+//! - **Automatic**: Optionally target by PID so no manual server-IP entry is needed.
+//! - **Secure**: Kernel-level interception on all platforms.
+//! - **IP-transparent**: Game server always sees the user's real IP.
+//! - **Recoverable**: Stale routes reset automatically.
+
+use std::net::SocketAddrV4;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::bypass::BypassConfig;
+use super::teardown::TeardownAck;
+use crate::games::TransportProto;
+use crate::tunnel::adaptive::AdaptiveConfig;
+use tokio::sync::oneshot;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Route & Process types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Transport protocol of an active socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TransportProtocol {
+    Udp,
+    Tcp,
+}
+
+impl std::fmt::Display for TransportProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Udp => write!(f, "UDP"),
+            Self::Tcp => write!(f, "TCP"),
+        }
+    }
+}
+
+/// A single active network connection observed from a game process.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Route {
+    /// Local socket address (game client side).
+    pub local: SocketAddrV4,
+    /// Remote socket address (game server).
+    pub remote: SocketAddrV4,
+    /// Transport protocol.
+    pub proto: TransportProtocol,
+}
+
+impl std::fmt::Display for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} → {}", self.proto, self.local, self.remote)
+    }
+}
+
+/// A running game process together with its observed network routes.
+#[derive(Clone, Debug)]
+pub struct ProcessInfo {
+    /// OS process ID.
+    pub pid: u32,
+    /// Process image name (e.g. `"RustClient.exe"`).
+    pub name: String,
+    /// Active UDP (and optionally TCP) connections belonging to this PID.
+    pub routes: Vec<Route>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Process target
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An authoritative process identity: "intercept this process".
+///
+/// The image name is the identity that survives a relaunch. A PID alone does
+/// not: the OS reuses PIDs, so a game restarted under a new PID would stop
+/// matching a number recorded earlier in the session. Whenever both fields are
+/// present the name decides, and the start path re-resolves the name to
+/// whatever PID is live at that moment.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ProcessTarget {
+    /// Image name, e.g. `"RustClient.exe"`. The preferred identity.
+    pub name: Option<String>,
+    /// OS process id, as recorded when the target was picked.
+    ///
+    /// A hint, not the identity: the start path overwrites it with the live
+    /// PID when the name still matches a running process.
+    pub pid: Option<u32>,
+}
+
+impl ProcessTarget {
+    /// Target an image by name - the identity that survives a relaunch.
+    pub fn by_name(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            pid: None,
+        }
+    }
+
+    /// Target a bare PID, for a caller that has no image name.
+    pub fn by_pid(pid: u32) -> Self {
+        Self {
+            name: None,
+            pid: Some(pid),
+        }
+    }
+
+    /// The image name to match, when the target names one.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The recorded PID, when the target carries one.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Whether the target identifies anything at all.
+    pub fn is_set(&self) -> bool {
+        self.name.is_some() || self.pid.is_some()
+    }
+
+    /// Human-readable identity for logs and error messages.
+    pub fn describe(&self) -> String {
+        match (self.name.as_deref(), self.pid) {
+            (Some(name), Some(pid)) => format!("{name} (PID {pid})"),
+            (Some(name), None) => name.to_string(),
+            (None, Some(pid)) => format!("PID {pid}"),
+            (None, None) => "<no process>".to_string(),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Interceptor config
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Full configuration passed to `TrafficInterceptor::start()`.
+#[derive(Clone, Debug)]
+pub struct InterceptorConfig {
+    /// Human-readable game name (for logging).
+    pub game_name: String,
+
+    /// Whether the resolved game profile rotates through ephemeral server
+    /// addresses (e.g. Fortnite).
+    ///
+    /// Carried as a resolved flag, never re-derived from `game_name`: the
+    /// config path must not depend on a display-name lookup, so a user profile
+    /// with no built-in display name behaves exactly like a built-in one.
+    /// When `true` the interceptor must not seed a lock from `initial_routes`
+    /// and must re-detect after every rotation.
+    pub dynamic_server: bool,
+
+    /// Transport the resolved profile carries its gameplay traffic over.
+    ///
+    /// UDP for every profile except Minecraft Java Edition's TCP.
+    pub transport: TransportProto,
+
+    /// Optional secondary TCP port range to capture alongside the primary
+    /// transport. `None` keeps the capture filter exactly as before.
+    pub capture_tcp_ports: Option<(u16, u16)>,
+
+    /// Image names of the resolved profile's process(es).
+    ///
+    /// Resolved once by the config builder so no backend rebuilds them from
+    /// `game_name`.
+    pub process_names: Vec<String>,
+
+    /// The process this session is authoritative for, when a user picked one.
+    ///
+    /// This is the ONE way to say "intercept this process". When it is set it
+    /// wins over every port-range derivation, so no caller has to reason about
+    /// two fields deciding the target. `None` is the built-in ports path: a
+    /// port-range filter plus debounce auto-detection.
+    ///
+    /// The image name is the identity and the PID is a point-in-time hint; see
+    /// [`ProcessTarget`].
+    pub process_target: Option<ProcessTarget>,
+
+    /// UDP port range to intercept when no specific server IP is known.
+    ///
+    /// Used as the WinDivert filter seed before the server IP is auto-detected
+    /// from traffic.  Format: `(low_port, high_port)`.
+    pub port_range: (u16, u16),
+
+    /// Pre-discovered server routes from the [`ProcessScanner`].
+    ///
+    /// If non-empty the interceptor can immediately lock onto the right server
+    /// rather than waiting for the debounce detector to accumulate N packets.
+    pub initial_routes: Vec<Route>,
+
+    /// LightSpeed proxy address to relay intercepted traffic through.
+    pub proxy_addr: SocketAddrV4,
+
+    /// Forward Error Correction enabled?
+    pub fec_enabled: bool,
+
+    /// FEC block size (K data packets per parity packet).
+    pub fec_k: u8,
+
+    /// Adaptive FEC/duplication policy for this path. Disabled by default,
+    /// which keeps the fixed `fec_k` block with parity on every block.
+    pub adaptive_fec: AdaptiveConfig,
+
+    /// Do-no-harm bypass gate configuration.
+    pub bypass: BypassConfig,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Counters & stats
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Shared atomic counters owned by the interceptor task.
+///
+/// The engine polls these (via `InterceptorHandle::snapshot()`) every GUI frame
+/// without taking a mutex.
+#[derive(Debug)]
+pub struct InterceptorCounters {
+    /// Outbound game packets intercepted and forwarded to proxy.
+    pub packets_intercepted: AtomicU64,
+    /// Every UDP packet the capture handle produced, before any policy.
+    ///
+    /// `packets_intercepted` counts what was *relayed*, so it reads zero both
+    /// when the filter is right and nothing needed relaying, and when the
+    /// filter is wrong and matched nothing at all. Those are opposite problems
+    /// and the field run that produced this counter could not tell them apart: a
+    /// capture filter aimed at the client's own ports logged
+    /// "interceptor started" and then saw no packets for an entire session.
+    pub packets_seen: AtomicU64,
+    /// Outbound datagrams the tunnel handed to the OS toward the relay.
+    ///
+    /// Separate from `packets_intercepted`, which counts what was *decided* to
+    /// be relayed: a send that fails never leaves the machine, so the pair tells
+    /// "no server chosen yet" (both zero) apart from "packets are going nowhere"
+    /// (intercepted climbing, sent not). A user whose match connects but feels
+    /// like packet loss has no other way to tell which relay-side fault this is.
+    pub packets_tunnel_sent: AtomicU64,
+    /// Bytes intercepted (outbound).
+    pub bytes_intercepted: AtomicU64,
+    /// Spoofed inbound packets injected back to the game.
+    pub packets_injected: AtomicU64,
+    /// Bytes injected (inbound).
+    pub bytes_injected: AtomicU64,
+    /// Proxy responses received.
+    pub packets_from_proxy: AtomicU64,
+    /// Errors (intercept or inject failures).
+    pub errors: AtomicU64,
+    /// Game payloads forwarded with fragmentation allowed because they
+    /// exceeded the conservative tunnel payload budget.
+    pub payloads_over_budget: AtomicU64,
+    /// Current inline adaptive parity-to-data ratio in basis points
+    /// (2500 = 1/4). Zero while adaptive FEC is off or parity is suppressed.
+    pub adaptive_parity_ratio_bp: AtomicU64,
+    /// Times the bypass gate decided Direct and the action layer honoured it.
+    pub bypass_allowed: AtomicU64,
+    /// Times a bypass was computed but not applied (dry run, fail-open, or an
+    /// unsafe mid-flow teardown), so the relay was kept.
+    pub bypass_refused: AtomicU64,
+    /// Bypass-gate evaluations that produced a decision.
+    pub bypass_decisions: AtomicU64,
+    /// Relay<->Direct state transitions recorded by the gate.
+    pub bypass_flips: AtomicU64,
+    /// Pre-gate evaluations that received a fresh client->relay RTT to
+    /// compare against the direct path (auto/dry_run).
+    pub bypass_pre_gate_rtt: AtomicU64,
+    /// Every steady-state bypass evaluation that ran (including gated ticks).
+    pub bypass_evaluations: AtomicU64,
+    /// Evaluations whose computed decision was Relay.
+    pub bypass_relay: AtomicU64,
+    /// Evaluations whose computed decision was Direct.
+    pub bypass_direct: AtomicU64,
+    /// Evaluations whose computed decision was Hold.
+    pub bypass_hold: AtomicU64,
+    /// Auto-detected (or pre-configured) server address.
+    /// SAFETY: This `std::sync::Mutex` is used from async tasks but the lock
+    /// is never held across an await point.  If that changes, migrate to
+    /// `tokio::sync::Mutex` and make `snapshot()` async.
+    pub detected_server: std::sync::Mutex<Option<SocketAddrV4>>,
+    /// Human-readable description of the most recent fatal error, if any.
+    pub last_error: std::sync::Mutex<Option<String>>,
+    /// Smoothed `direct - relayed` advantage in milliseconds, when measured.
+    ///
+    /// The project's central number: whether the relay is actually beating the
+    /// direct path. Surfaced so a consumer-facing status can say it in words
+    /// instead of leaving it in a log field.
+    pub bypass_advantage_ms: std::sync::Mutex<Option<f32>>,
+    /// Plain-language explanation set when the capture is producing nothing.
+    ///
+    /// Distinct from [`Self::last_error`]: nothing has failed, and the tunnel is
+    /// healthy, but the app is not doing its job and would otherwise report
+    /// success indefinitely.
+    pub capture_diagnosis: std::sync::Mutex<Option<String>>,
+}
+
+impl Default for InterceptorCounters {
+    fn default() -> Self {
+        Self {
+            packets_intercepted: AtomicU64::new(0),
+            bytes_intercepted: AtomicU64::new(0),
+            packets_injected: AtomicU64::new(0),
+            bytes_injected: AtomicU64::new(0),
+            packets_from_proxy: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            payloads_over_budget: AtomicU64::new(0),
+            adaptive_parity_ratio_bp: AtomicU64::new(0),
+            bypass_allowed: AtomicU64::new(0),
+            bypass_refused: AtomicU64::new(0),
+            bypass_decisions: AtomicU64::new(0),
+            bypass_flips: AtomicU64::new(0),
+            bypass_pre_gate_rtt: AtomicU64::new(0),
+            bypass_evaluations: AtomicU64::new(0),
+            bypass_relay: AtomicU64::new(0),
+            bypass_direct: AtomicU64::new(0),
+            bypass_hold: AtomicU64::new(0),
+            detected_server: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            bypass_advantage_ms: std::sync::Mutex::new(None),
+            packets_seen: AtomicU64::new(0),
+            packets_tunnel_sent: AtomicU64::new(0),
+            capture_diagnosis: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl InterceptorCounters {
+    /// Take a cheap snapshot for GUI display.
+    pub fn snapshot(&self, platform: &'static str) -> InterceptorStats {
+        InterceptorStats {
+            packets_intercepted: self.packets_intercepted.load(Ordering::Relaxed),
+            bytes_intercepted: self.bytes_intercepted.load(Ordering::Relaxed),
+            packets_injected: self.packets_injected.load(Ordering::Relaxed),
+            bytes_injected: self.bytes_injected.load(Ordering::Relaxed),
+            packets_from_proxy: self.packets_from_proxy.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            payloads_over_budget: self.payloads_over_budget.load(Ordering::Relaxed),
+            adaptive_parity_ratio_bp: self.adaptive_parity_ratio_bp.load(Ordering::Relaxed),
+            bypass_allowed: self.bypass_allowed.load(Ordering::Relaxed),
+            bypass_refused: self.bypass_refused.load(Ordering::Relaxed),
+            bypass_decisions: self.bypass_decisions.load(Ordering::Relaxed),
+            bypass_flips: self.bypass_flips.load(Ordering::Relaxed),
+            bypass_pre_gate_rtt: self.bypass_pre_gate_rtt.load(Ordering::Relaxed),
+            bypass_evaluations: self.bypass_evaluations.load(Ordering::Relaxed),
+            bypass_relay: self.bypass_relay.load(Ordering::Relaxed),
+            bypass_direct: self.bypass_direct.load(Ordering::Relaxed),
+            bypass_hold: self.bypass_hold.load(Ordering::Relaxed),
+            detected_server: self.detected_server.lock().map(|g| *g).unwrap_or(None),
+            last_error: self.last_error.lock().ok().and_then(|g| g.clone()),
+            bypass_advantage_ms: self.bypass_advantage_ms.lock().ok().and_then(|g| *g),
+            packets_seen: self.packets_seen.load(Ordering::Relaxed),
+            packets_tunnel_sent: self.packets_tunnel_sent.load(Ordering::Relaxed),
+            capture_diagnosis: self.capture_diagnosis.lock().ok().and_then(|g| g.clone()),
+            // Run-level state, filled in by the handle: the gate lives there, not
+            // in the counters.
+            tunnelling_enabled: None,
+            platform,
+        }
+    }
+}
+
+/// Cheap snapshot of interceptor state for GUI display.
+#[derive(Clone, Debug, Default)]
+pub struct InterceptorStats {
+    pub packets_intercepted: u64,
+    pub bytes_intercepted: u64,
+    pub packets_injected: u64,
+    pub bytes_injected: u64,
+    pub packets_from_proxy: u64,
+    pub errors: u64,
+    /// Payloads forwarded with fragmentation allowed for exceeding the
+    /// conservative tunnel payload budget.
+    pub payloads_over_budget: u64,
+    /// Current inline adaptive parity-to-data ratio in basis points.
+    pub adaptive_parity_ratio_bp: u64,
+    /// Times the bypass gate decided Direct and it was honoured.
+    pub bypass_allowed: u64,
+    /// Times a bypass was computed but not applied, so the relay was kept.
+    pub bypass_refused: u64,
+    /// Bypass-gate evaluations that produced a decision.
+    pub bypass_decisions: u64,
+    /// Relay<->Direct state transitions recorded by the gate.
+    pub bypass_flips: u64,
+    /// Pre-gate evaluations that received a fresh client->relay RTT.
+    pub bypass_pre_gate_rtt: u64,
+    /// Every steady-state bypass evaluation that ran.
+    pub bypass_evaluations: u64,
+    /// Evaluations whose computed decision was Relay.
+    pub bypass_relay: u64,
+    /// Evaluations whose computed decision was Direct.
+    pub bypass_direct: u64,
+    /// Evaluations whose computed decision was Hold.
+    pub bypass_hold: u64,
+    /// The game server address discovered at runtime (or pre-configured).
+    pub detected_server: Option<SocketAddrV4>,
+    /// Description of the most recent fatal error, if any.
+    pub last_error: Option<String>,
+    /// Whether this run is permitted to tunnel, or `None` when the backend has
+    /// no gate.
+    ///
+    /// Surfaced so a UI can say "waiting to learn the game server" instead of
+    /// showing an idle-looking app while a hold is deliberately withholding the
+    /// relay. A hold with no explanation is indistinguishable from a fault.
+    pub tunnelling_enabled: Option<bool>,
+    /// Smoothed `direct - relayed` advantage in milliseconds, when measured:
+    /// positive means the relay is beating the direct path.
+    pub bypass_advantage_ms: Option<f32>,
+    /// Plain-language explanation when the capture is producing nothing, so a
+    /// consumer can be told "this is not working" instead of being shown a
+    /// healthy-looking status.
+    pub capture_diagnosis: Option<String>,
+    /// Every UDP packet the capture handle produced, before any policy.
+    pub packets_seen: u64,
+    /// Outbound datagrams actually handed to the OS toward the relay.
+    pub packets_tunnel_sent: u64,
+    /// Platform name: `"WinDivert"`, `"nftables"`, `"pf"`, …
+    pub platform: &'static str,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Live handle returned by start()
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Platform-specific teardown wiring for a running interceptor.
+///
+/// A platform-neutral [`InterceptorHandle`] cannot release a WinDivert receive
+/// thread parked in a blocking `recv`, and it cannot know when every owner
+/// thread has stopped touching the driver handle. A backend that has those
+/// needs bundles them here:
+///
+/// - `unblock` releases the parked thread (for example `WinDivertShutdown`).
+///   It runs at most once, from [`InterceptorHandle::stop`].
+/// - `ack` completes when every owner thread confirmed it can no longer touch
+///   the handle, so the driver state can be released deterministically.
+///
+/// Backends without blocking receive threads (Linux, macOS, mock) pass `None`
+/// to [`InterceptorHandle::new`] and keep the signalling-only behaviour.
+pub struct PlatformTeardown {
+    unblock: Box<dyn FnOnce() + Send>,
+    ack: TeardownAck,
+}
+
+impl PlatformTeardown {
+    /// Bundle an unblock hook with the acknowledgement of its owner threads.
+    pub(super) fn new(unblock: impl FnOnce() + Send + 'static, ack: TeardownAck) -> Self {
+        Self {
+            unblock: Box::new(unblock),
+            ack,
+        }
+    }
+}
+
+/// Handle to an active interceptor session, returned by `TrafficInterceptor::start()`.
+///
+/// Dropping this handle calls `stop()` (it sends the shutdown signal and
+/// releases any thread parked in a blocking platform receive) but does NOT
+/// block: background tasks clean up asynchronously. Call
+/// [`stop_and_wait`](Self::stop_and_wait) when the caller must know the
+/// platform resources were actually released.
+pub struct InterceptorHandle {
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    pub counters: Arc<InterceptorCounters>,
+    platform: &'static str,
+    /// Releases a thread parked in a blocking platform receive. Taken on the
+    /// first `stop()`, so it never runs twice.
+    unblock: Option<Box<dyn FnOnce() + Send>>,
+    /// Completes once every platform owner thread acknowledged that it stopped
+    /// touching its handle.
+    teardown_ack: Option<TeardownAck>,
+    /// Where this run is allowed to tunnel, when the backend supports holding.
+    ///
+    /// `None` on a backend that has not implemented the gate, which is why
+    /// [`Self::set_tunnelling_enabled`] reports whether it applied instead of
+    /// returning nothing: a caller must be able to tell "held" from "this
+    /// backend ignored me", or it would wait forever for a hold that never
+    /// happened.
+    tunnelling: Option<Arc<AtomicBool>>,
+}
+
+impl InterceptorHandle {
+    pub(super) fn new(
+        shutdown_tx: oneshot::Sender<()>,
+        counters: Arc<InterceptorCounters>,
+        platform: &'static str,
+        teardown: Option<PlatformTeardown>,
+    ) -> Self {
+        let (unblock, teardown_ack) = match teardown {
+            Some(teardown) => (Some(teardown.unblock), Some(teardown.ack)),
+            None => (None, None),
+        };
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            counters,
+            platform,
+            unblock,
+            teardown_ack,
+            tunnelling: None,
+        }
+    }
+
+    /// The switch that gates tunnelling for this run, when the backend has one.
+    ///
+    /// A caller that has to hold traffic and also learn something the held run
+    /// discovers (the game server, for instance) attaches its own watcher to
+    /// this switch instead of polling: the platform flips it and the watcher
+    /// sees the flip. `None` on a backend with no gate.
+    pub fn tunnelling_switch(&self) -> Option<Arc<AtomicBool>> {
+        self.tunnelling.clone()
+    }
+
+    /// Hand this run the switch that gates tunnelling, so a caller can hold
+    /// traffic until it has chosen a relay for the game server.
+    ///
+    /// Only the backend that implements the gate calls this; elsewhere the
+    /// handle simply carries `None` and [`Self::set_tunnelling_enabled`] reports
+    /// that it did not apply.
+    pub fn attach_tunnelling_switch(&mut self, switch: Arc<AtomicBool>) {
+        self.tunnelling = Some(switch);
+    }
+
+    /// Allow or withhold tunnelling for this run.
+    ///
+    /// Returns whether the backend honoured it. `false` means this platform has
+    /// no gate, so the caller must NOT assume traffic is being held.
+    pub fn set_tunnelling_enabled(&self, enabled: bool) -> bool {
+        match &self.tunnelling {
+            Some(switch) => {
+                switch.store(enabled, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether tunnelling is currently permitted, or `None` when this backend
+    /// has no gate.
+    pub fn tunnelling_enabled(&self) -> Option<bool> {
+        self.tunnelling
+            .as_ref()
+            .map(|switch| switch.load(Ordering::Relaxed))
+    }
+
+    /// Snapshot the live counters - cheap, no lock held.
+    pub fn snapshot(&self) -> InterceptorStats {
+        let mut stats = self.counters.snapshot(self.platform);
+        // The gate lives on the handle rather than the counters, because it is
+        // run-level state: the whole run is either permitted to tunnel or held.
+        stats.tunnelling_enabled = self.tunnelling_enabled();
+        stats
+    }
+
+    /// Send the shutdown signal and release any thread parked in a blocking
+    /// platform receive. Background tasks exit asynchronously; use
+    /// [`stop_and_wait`](Self::stop_and_wait) to wait for them.
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        // Taking the hook here means mixing `stop()` and `stop_and_wait()`
+        // still runs it exactly once.
+        if let Some(unblock) = self.unblock.take() {
+            unblock();
+        }
+    }
+
+    /// Stop intercepting and wait up to `timeout` for every platform owner
+    /// thread to release its handle.
+    ///
+    /// Returns `true` immediately when the platform needs no teardown
+    /// acknowledgement (Linux, macOS, mock), and `true` when every owner
+    /// thread acknowledged within `timeout`. Returns `false` on timeout: a
+    /// platform thread may still be touching its handle, so the caller must
+    /// not assume the kernel filter was released.
+    pub fn stop_and_wait(&mut self, timeout: Duration) -> bool {
+        self.stop();
+        match self.teardown_ack.take() {
+            Some(ack) => ack.wait(timeout),
+            None => true,
+        }
+    }
+
+    /// Whether the shutdown signal has NOT been sent yet.
+    pub fn is_active(&self) -> bool {
+        self.shutdown_tx.is_some()
+    }
+}
+
+impl Drop for InterceptorHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Core trait
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Platform-specific traffic interception.
+///
+/// Implementations intercept outbound game-UDP packets at the OS/kernel level,
+/// tunnel them through the LightSpeed proxy, and inject spoofed server→game
+/// responses - all transparently.
+///
+/// # Platform map
+///
+/// | Platform | Mechanism                         | Precision        |
+/// |----------|-----------------------------------|------------------|
+/// | Windows  | WinDivert (NDIS kernel driver)    | Per-process PID  |
+/// | Linux    | nftables TPROXY / iptables REDIRECT | cgroup or UID  |
+/// | macOS    | pfctl `rdr-to` anchor             | Port-based        |
+///
+/// All implementations preserve the user's real IP end-to-end (NOT a VPN -
+/// the game server always sees the client's original source address).
+pub trait TrafficInterceptor: Send + Sync {
+    /// Start intercepting traffic according to `config`.
+    ///
+    /// Spawns async/blocking background tasks and returns immediately.
+    /// The returned [`InterceptorHandle`] carries live counters and a shutdown
+    /// signal. Dropping the handle stops interception.
+    fn start(&self, config: InterceptorConfig) -> anyhow::Result<InterceptorHandle>;
+
+    /// Human-readable platform identifier, e.g. `"WinDivert"`.
+    fn platform_name(&self) -> &'static str;
+
+    /// Whether this interceptor can run on the current OS + feature set.
+    ///
+    /// Returns `Err` with a human-readable explanation if unavailable.
+    fn check_availability(&self) -> Result<(), String>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Stub for unsupported platforms
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `TrafficInterceptor` that always fails - used when no backend is compiled in.
+pub struct UnsupportedInterceptor {
+    reason: String,
+}
+
+impl UnsupportedInterceptor {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl TrafficInterceptor for UnsupportedInterceptor {
+    fn start(&self, _config: InterceptorConfig) -> anyhow::Result<InterceptorHandle> {
+        anyhow::bail!("{}", self.reason)
+    }
+
+    fn platform_name(&self) -> &'static str {
+        "unsupported"
+    }
+
+    fn check_availability(&self) -> Result<(), String> {
+        Err(self.reason.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    fn config_for(game_name: &str) -> InterceptorConfig {
+        InterceptorConfig {
+            game_name: game_name.to_string(),
+            dynamic_server: false,
+            transport: TransportProto::Udp,
+            capture_tcp_ports: None,
+            process_names: vec!["TestGame.exe".to_string()],
+            process_target: None,
+            port_range: (1, 2),
+            initial_routes: vec![],
+            proxy_addr: "127.0.0.1:4434".parse().unwrap(),
+            fec_enabled: false,
+            fec_k: 4,
+            adaptive_fec: Default::default(),
+            bypass: Default::default(),
+        }
+    }
+
+    fn handle_with(teardown: Option<PlatformTeardown>) -> InterceptorHandle {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        InterceptorHandle::new(
+            shutdown_tx,
+            Arc::new(InterceptorCounters::default()),
+            "test",
+            teardown,
+        )
+    }
+
+    #[test]
+    fn resolved_flags_are_carried_verbatim_not_looked_up_by_name() {
+        // A display name that maps to no profile keeps whatever the resolved
+        // flags say: nothing on the config path looks a name up any more, so
+        // the values the builder resolved are the values a backend reads.
+        let mut config = config_for("Definitely Not A Game");
+        assert!(!config.dynamic_server);
+
+        config.dynamic_server = true;
+        config.transport = TransportProto::Tcp;
+        config.process_names = vec!["Other.exe".to_string()];
+
+        assert!(config.dynamic_server);
+        assert_eq!(config.transport, TransportProto::Tcp);
+        assert_eq!(config.process_names, vec!["Other.exe".to_string()]);
+    }
+
+    #[test]
+    fn stop_and_wait_without_teardown_returns_true() {
+        let mut handle = handle_with(None);
+        assert!(handle.stop_and_wait(Duration::from_millis(50)));
+        assert!(!handle.is_active());
+    }
+
+    #[test]
+    fn stop_and_wait_waits_for_the_owner_thread_to_ack() {
+        let (ack_tx, ack) = TeardownAck::new(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let owner = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            let _ = ack_tx.send(());
+        });
+        let teardown = PlatformTeardown::new(
+            move || {
+                let _ = release_tx.send(());
+            },
+            ack,
+        );
+        let mut handle = handle_with(Some(teardown));
+
+        assert!(handle.stop_and_wait(Duration::from_millis(500)));
+
+        owner.join().expect("owner thread must finish");
+    }
+
+    #[test]
+    fn unblock_hook_runs_exactly_once_across_stop_and_stop_and_wait() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hook = Arc::clone(&calls);
+        let (ack_tx, ack) = TeardownAck::new(1);
+        let teardown = PlatformTeardown::new(
+            move || {
+                calls_hook.fetch_add(1, Ordering::Relaxed);
+                let _ = ack_tx.send(());
+            },
+            ack,
+        );
+        let mut handle = handle_with(Some(teardown));
+
+        handle.stop();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "stop() must run the unblock hook"
+        );
+
+        assert!(handle.stop_and_wait(Duration::from_millis(50)));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the unblock hook must never run twice"
+        );
+    }
+
+    #[test]
+    fn stop_and_wait_returns_false_when_the_ack_never_arrives() {
+        let (ack_tx, ack) = TeardownAck::new(1);
+        let teardown = PlatformTeardown::new(|| {}, ack);
+        let mut handle = handle_with(Some(teardown));
+
+        assert!(!handle.stop_and_wait(Duration::from_millis(30)));
+
+        // The sender stayed alive for the whole wait, so the failure is the
+        // timeout, not an early channel disconnect.
+        drop(ack_tx);
+    }
+}

@@ -1,0 +1,28 @@
+name: Build Windows GUI (GameLoop multi-process patch)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p lightspeed-gui
+      - name: Collect files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/lightspeed-gui.exe dist/
+          Copy-Item client/windivert/WinDivert.dll dist/
+          Copy-Item client/windivert/WinDivert64.sys dist/
+          Copy-Item client/windivert/LICENSE.windivert dist/
+          Copy-Item LICENSE dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lightspeed-gameloop-windows
+          path: dist/

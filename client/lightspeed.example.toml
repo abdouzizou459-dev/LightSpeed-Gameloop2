@@ -1,0 +1,131 @@
+# LightSpeed client configuration
+#
+# Written by `lightspeed --write-config`. See docs/user-guide.md for details.
+# Every setting is optional: delete a line to fall back to its documented
+# default. Values shown below are the defaults.
+
+[proxy]
+# Relay addresses to tunnel game traffic through ("ip:port" or "host:port").
+# Leave empty to auto-discover the community relays from the signed registry.
+#
+# Community relay network (data-plane UDP port 4434):
+#   servers = [
+#     "207.246.106.36:4434",   # relay-lax-1 (Los Angeles)
+#     "207.246.124.117:4434",  # relay-ewr-1 (New Jersey)
+#     "45.77.32.236:4434",     # relay-sgp-1 (Singapore)
+#     "95.179.164.138:4434",   # relay-fra   (Frankfurt)
+#     "167.179.77.127:4434",   # relay-nrt   (Tokyo)
+#   ]
+servers = []
+
+# QUIC control-plane port (shared by all relays). Default: 4433.
+quic_port = 4433
+
+# UDP data-plane port (shared by all relays). Default: 4434.
+data_port = 4434
+
+[registry]
+# Signed node list used for zero-config discovery (must be https). Leave unset
+# to use the built-in community registry.
+# url = "https://shibbityshwab.github.io/lightspeed/registry.json"
+
+# Operator Ed25519 public key (base64) that signs the registry. Leave unset to
+# use the built-in operator key.
+# operator_key = ""
+
+[general]
+# Log verbosity: trace, debug, info, warn, error. Default: info.
+log_level = "info"
+
+# Anonymous aggregate telemetry (latency percentiles + FEC stats only, no
+# IPs, identifiers, or packet content). On by default. See docs/privacy.md.
+# Set to false (or run with --no-telemetry) to opt out.
+telemetry = true
+
+# Capture interface; auto-detected when unset.
+# interface = "eth0"
+
+[tunnel]
+# Keepalive interval in milliseconds. Default: 5000.
+keepalive_ms = 5000
+
+# Connection timeout in milliseconds. Default: 10000.
+timeout_ms = 10000
+
+# Maximum packet size (MTU). Default: 1400.
+mtu = 1400
+
+# Client-to-relay transport: "udp" (default) or "tcp".
+transport = "udp"
+
+# Mark tunnel packets with DSCP Expedited Forwarding (EF, 46) so the player's
+# own router or ISP can prioritise them. Off by default: only the local hop may
+# honour it, later hops may ignore or reclassify it, and stamping EF without the
+# network's consent can be policed. Ignored on Windows. Default: false.
+dscp = false
+
+# Adaptive FEC and loss-gated packet duplication. Off by default. When on, the
+# client sends no parity on a clean link, returns to low overhead quickly once
+# loss stops, and duplicates a packet only while loss or jitter is measured.
+adaptive_fec = false
+
+# Hard ceiling on adaptive FEC parity overhead, in percent. Default: 25.
+# Bounds the effective block size to ceil(100 / pct), so even under sustained
+# loss the adaptive mode never adds more parity than this.
+fec_max_overhead_pct = 25
+
+# Discover the real client-to-relay path MTU (DPLPMTUD) and raise the tunnel
+# payload budget when the path supports it. Off by default: with it off the
+# client uses today's fixed conservative clamp. Any failure or ambiguity falls
+# back to that clamp. Also available as --path-mtu-discovery.
+path_mtu_discovery = false
+
+[route]
+# Route selection strategy: "destination" (default), "nearest", "multipath",
+# or "ml". "destination" ranks relays by the whole path; "nearest" opts into
+# client-proximity selection. Unknown values fall back to "nearest".
+strategy = "destination"
+
+# Send on multiple relay paths and use the fastest. Default: false.
+multipath = false
+
+# Maximum simultaneous relay paths when multipath is enabled. Default: 2.
+multipath_max_paths = 2
+
+# Health-check interval in milliseconds. Default: 10000.
+health_check_ms = 10000
+
+# Maximum proxy failover attempts. Default: 3.
+max_failover = 3
+
+# Do-no-harm bypass gate: tunnel a session only when the relay actually helps,
+# otherwise connect directly. "dry_run" (default) measures and logs the
+# decision and changes nothing; "auto" acts only where it is safe; "never" is
+# the complete rollback; "always" forces direct (testing only).
+bypass = "dry_run"
+
+# Relay-worse threshold (ms) at which the gate may prefer the direct path.
+bypass_margin_ms = 8
+
+# Relay-better threshold (ms) at which the relay is kept.
+bypass_keep_ms = 5
+
+# Quiet period after a bypass decision (seconds).
+bypass_dwell_s = 120
+
+# Minimum probation time before a bypass verdict (seconds).
+bypass_probation_s = 20
+
+[ml]
+# Path to a pre-trained route model; unset trains on the fly.
+# model_path = "/path/to/model.bin"
+
+# Adapt the model in real time from live RTT samples. Default: false.
+online_learning = false
+
+# Minimum samples before an online model update. Default: 50.
+min_samples = 50
+
+[interception]
+# Interception backend: "auto" (default), "userspace", or "kernel".
+mode = "auto"
