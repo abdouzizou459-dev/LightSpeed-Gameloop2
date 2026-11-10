@@ -22,7 +22,7 @@ jobs:
           Copy-Item client/windivert/WinDivert64.sys dist/
           Copy-Item client/windivert/LICENSE.windivert dist/
           Copy-Item LICENSE dist/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lightspeed-gameloop-windows
           path: dist/
